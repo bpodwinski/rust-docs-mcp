@@ -173,6 +173,19 @@ impl CrateDownloader {
             version
         );
 
+        if let Some(source_path) = self.try_copy_from_cargo_registry(name, version)? {
+            tracing::info!(
+                "Reused Cargo registry source for {}-{} at {}",
+                name,
+                version,
+                source_path.display()
+            );
+            if let Some(callback) = progress_callback {
+                callback(100);
+            }
+            return Ok(source_path);
+        }
+
         let url = format!("https://crates.io/api/v1/crates/{name}/{version}/download");
         tracing::debug!("Download URL: {}", url);
 
@@ -527,6 +540,76 @@ impl CrateDownloader {
         Ok(source_path)
     }
 
+    fn try_copy_from_cargo_registry(&self, name: &str, version: &str) -> Result<Option<PathBuf>> {
+        let Some(cargo_source_path) = self.find_cargo_registry_source(name, version)? else {
+            return Ok(None);
+        };
+
+        tracing::info!(
+            "Found Cargo registry source for {}-{} at {}",
+            name,
+            version,
+            cargo_source_path.display()
+        );
+
+        let source_path = self.storage.source_path(name, version)?;
+        self.storage.ensure_dir(&source_path)?;
+        copy_directory_contents(&cargo_source_path, &source_path)
+            .context("Failed to copy Cargo registry source into cache")?;
+
+        self.storage.save_metadata_with_source(
+            name,
+            version,
+            "crates.io",
+            Some(cargo_source_path.to_string_lossy().as_ref()),
+            None,
+        )?;
+
+        Ok(Some(source_path))
+    }
+
+    fn find_cargo_registry_source(&self, name: &str, version: &str) -> Result<Option<PathBuf>> {
+        let Some(cargo_home) = Self::cargo_home() else {
+            tracing::debug!("Cargo home not found while checking local registry cache");
+            return Ok(None);
+        };
+
+        let registry_src_root = cargo_home.join("registry").join("src");
+        if !registry_src_root.is_dir() {
+            tracing::debug!(
+                "Cargo registry source directory does not exist: {}",
+                registry_src_root.display()
+            );
+            return Ok(None);
+        }
+
+        let crate_dir_name = format!("{name}-{version}");
+        for registry_entry in fs::read_dir(&registry_src_root).with_context(|| {
+            format!(
+                "Failed to read Cargo registry source directory: {}",
+                registry_src_root.display()
+            )
+        })? {
+            let registry_entry = registry_entry?;
+            if !registry_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let candidate = registry_entry.path().join(&crate_dir_name);
+            if candidate.join(CARGO_TOML).is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn cargo_home() -> Option<PathBuf> {
+        env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+    }
+
     /// Validate git reference name to prevent potential issues
     fn is_valid_git_ref(ref_name: &str) -> bool {
         // Git references must not:
@@ -559,7 +642,25 @@ impl CrateDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn cargo_home_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_cargo_home(path: &Path) {
+        unsafe {
+            env::set_var("CARGO_HOME", path);
+        }
+    }
+
+    fn remove_cargo_home() {
+        unsafe {
+            env::remove_var("CARGO_HOME");
+        }
+    }
 
     #[test]
     fn test_downloader_creation() {
@@ -624,5 +725,89 @@ mod tests {
                 panic!("Failed to download google-sheets4: {e}");
             }
         }
+    }
+
+    #[test]
+    fn test_find_cargo_registry_source_uses_configured_cargo_home() {
+        let _guard = cargo_home_lock().lock().unwrap();
+
+        let cargo_home_dir = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+        let cached_source = cargo_home_dir
+            .path()
+            .join("registry/src/index.crates.io-test/cached-crate-9.9.9");
+        fs::create_dir_all(cached_source.join("src")).unwrap();
+        fs::write(
+            cached_source.join(CARGO_TOML),
+            "[package]\nname = \"cached-crate\"\nversion = \"9.9.9\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            cached_source.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        set_cargo_home(cargo_home_dir.path());
+
+        let storage = CacheStorage::new(Some(storage_dir.path().to_path_buf())).unwrap();
+        let downloader = CrateDownloader::new(storage);
+        let found = downloader
+            .find_cargo_registry_source("cached-crate", "9.9.9")
+            .unwrap();
+
+        remove_cargo_home();
+
+        assert_eq!(found, Some(cached_source));
+    }
+
+    #[tokio::test]
+    async fn test_download_crate_reuses_cargo_registry_source() {
+        let _guard = cargo_home_lock().lock().unwrap();
+
+        let cargo_home_dir = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+        let cached_source = cargo_home_dir
+            .path()
+            .join("registry/src/index.crates.io-test/cached-crate-9.9.9");
+        fs::create_dir_all(cached_source.join("src")).unwrap();
+        fs::write(
+            cached_source.join(CARGO_TOML),
+            "[package]\nname = \"cached-crate\"\nversion = \"9.9.9\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            cached_source.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        set_cargo_home(cargo_home_dir.path());
+
+        let storage = CacheStorage::new(Some(storage_dir.path().to_path_buf())).unwrap();
+        let downloader = CrateDownloader::new(storage.clone());
+
+        let cached_path = downloader
+            .download_crate("cached-crate", "9.9.9", None)
+            .await
+            .unwrap();
+
+        remove_cargo_home();
+
+        assert_eq!(
+            cached_path,
+            storage.source_path("cached-crate", "9.9.9").unwrap()
+        );
+        assert!(cached_path.join(CARGO_TOML).exists());
+        assert!(cached_path.join("src/lib.rs").exists());
+
+        let metadata = storage
+            .load_metadata("cached-crate", "9.9.9", None)
+            .unwrap();
+        assert_eq!(metadata.source, "crates.io");
+        assert_eq!(
+            metadata.source_path,
+            Some(cached_source.to_string_lossy().to_string())
+        );
     }
 }
