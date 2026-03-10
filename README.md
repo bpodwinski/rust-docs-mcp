@@ -193,6 +193,15 @@ cargo install rust-docs-mcp
   rustup toolchain install nightly
   ```
 
+  Runtime prefers `nightly-2025-06-24` because it matches the rustdoc JSON
+  schema used by `rustdoc-types`, but it will fall back to `nightly` when that
+  toolchain produces the same JSON format version. You can override the choice
+  with:
+
+  ```bash
+  export RUST_DOCS_MCP_TOOLCHAIN=nightly
+  ```
+
 - Network access to download crates from [crates.io](https://crates.io)
 
 ```bash
