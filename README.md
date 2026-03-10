@@ -15,7 +15,7 @@ Rust crate documentation, source code analysis, dependency trees, and module
 structure visualization. Built for agents to gain quality insights into Rust
 projects and build with confidence.
 
-# Warning
+## Warning
 
 This is an entirely vibe coded project and was created as an experiment to see if LLMs can build a fully functional tool without human oversight.
 
