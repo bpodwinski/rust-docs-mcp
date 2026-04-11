@@ -733,9 +733,15 @@ mod tests {
 
         let cargo_home_dir = TempDir::new().unwrap();
         let storage_dir = TempDir::new().unwrap();
+        // Build the path one component at a time so the separator is
+        // platform-native on Windows (otherwise the embedded `/` ends up
+        // preserved verbatim and breaks string-based path comparisons).
         let cached_source = cargo_home_dir
             .path()
-            .join("registry/src/index.crates.io-test/cached-crate-9.9.9");
+            .join("registry")
+            .join("src")
+            .join("index.crates.io-test")
+            .join("cached-crate-9.9.9");
         fs::create_dir_all(cached_source.join("src")).unwrap();
         fs::write(
             cached_source.join(CARGO_TOML),
@@ -761,15 +767,25 @@ mod tests {
         assert_eq!(found, Some(cached_source));
     }
 
+    // The guard is intentionally held across the `.await` below to serialize
+    // `CARGO_HOME` mutation with the sync test above — no other async task
+    // contends for this lock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_download_crate_reuses_cargo_registry_source() {
         let _guard = cargo_home_lock().lock().unwrap();
 
         let cargo_home_dir = TempDir::new().unwrap();
         let storage_dir = TempDir::new().unwrap();
+        // Build the path one component at a time so the separator is
+        // platform-native on Windows (otherwise the embedded `/` ends up
+        // preserved verbatim and breaks string-based path comparisons).
         let cached_source = cargo_home_dir
             .path()
-            .join("registry/src/index.crates.io-test/cached-crate-9.9.9");
+            .join("registry")
+            .join("src")
+            .join("index.crates.io-test")
+            .join("cached-crate-9.9.9");
         fs::create_dir_all(cached_source.join("src")).unwrap();
         fs::write(
             cached_source.join(CARGO_TOML),
