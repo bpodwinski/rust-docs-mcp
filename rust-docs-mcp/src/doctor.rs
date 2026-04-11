@@ -74,66 +74,38 @@ async fn check_rust_toolchain() -> DiagnosticResult {
 }
 
 async fn check_nightly_toolchain() -> DiagnosticResult {
-    match Command::new("rustup").args(["toolchain", "list"]).output() {
-        Ok(output) if output.status.success() => {
-            let toolchains = String::from_utf8_lossy(&output.stdout);
-            if toolchains.contains("nightly") {
-                // Try to get nightly version
-                match Command::new("rustc")
-                    .args(["+nightly", "--version"])
-                    .output()
-                {
-                    Ok(nightly_output) if nightly_output.status.success() => {
-                        let version = String::from_utf8_lossy(&nightly_output.stdout)
-                            .trim()
-                            .to_string();
-                        DiagnosticResult::new("Nightly toolchain".to_string(), true, version, true)
-                    }
-                    _ => DiagnosticResult::new(
-                        "Nightly toolchain".to_string(),
-                        false,
-                        "nightly toolchain installed but not functional".to_string(),
-                        true,
-                    ),
-                }
-            } else {
-                DiagnosticResult::new(
-                    "Nightly toolchain".to_string(),
-                    false,
-                    "nightly toolchain not installed".to_string(),
-                    true,
-                )
-            }
-        }
-        Ok(_) => DiagnosticResult::new(
+    match rustdoc::resolve_toolchain() {
+        Ok(toolchain) => match rustdoc::get_rustdoc_version_for_toolchain(&toolchain) {
+            Ok(version) => DiagnosticResult::new(
+                "Nightly toolchain".to_string(),
+                true,
+                format!("{version} (selected: {toolchain})"),
+                true,
+            ),
+            Err(error) => DiagnosticResult::new(
+                "Nightly toolchain".to_string(),
+                false,
+                format!("selected toolchain {toolchain} is not functional: {error}"),
+                true,
+            ),
+        },
+        Err(error) => DiagnosticResult::new(
             "Nightly toolchain".to_string(),
             false,
-            "rustup command failed".to_string(),
-            true,
-        ),
-        Err(_) => DiagnosticResult::new(
-            "Nightly toolchain".to_string(),
-            false,
-            "rustup not found in PATH".to_string(),
+            error.to_string(),
             true,
         ),
     }
 }
 
 async fn check_rustdoc_json() -> DiagnosticResult {
-    // First check if rustdoc is available
-    match rustdoc::get_rustdoc_version().await {
-        Ok(version) => {
-            // Try to test JSON generation using the unified function
-            match rustdoc::test_rustdoc_json().await {
+    match rustdoc::resolve_toolchain() {
+        Ok(toolchain) => match rustdoc::get_rustdoc_version_for_toolchain(&toolchain) {
+            Ok(version) => match rustdoc::test_rustdoc_json().await {
                 Ok(_) => DiagnosticResult::new(
                     "Rustdoc JSON".to_string(),
                     true,
-                    format!(
-                        "{} with JSON support (toolchain: {})",
-                        version,
-                        rustdoc::REQUIRED_TOOLCHAIN
-                    ),
+                    format!("{version} with JSON support (toolchain: {toolchain})"),
                     false,
                 ),
                 Err(e) => {
@@ -145,14 +117,17 @@ async fn check_rustdoc_json() -> DiagnosticResult {
                         false,
                     )
                 }
-            }
+            },
+            Err(error) => DiagnosticResult::new(
+                "Rustdoc JSON".to_string(),
+                false,
+                format!("Failed to inspect selected toolchain {toolchain}: {error}"),
+                false,
+            ),
+        },
+        Err(error) => {
+            DiagnosticResult::new("Rustdoc JSON".to_string(), false, error.to_string(), false)
         }
-        Err(_) => DiagnosticResult::new(
-            "Rustdoc JSON".to_string(),
-            false,
-            "rustdoc not found in PATH".to_string(),
-            false,
-        ),
     }
 }
 

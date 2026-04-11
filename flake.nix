@@ -32,7 +32,7 @@
         # Use rust-toolchain.toml for the exact nightly version
         rustToolchain = inputs'.fenix.packages.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-UAoZcxg3iWtS+2n8TFNfANFt/GmkuOMDf7QAE0fRxeA=";
+          sha256 = "";
         };
 
         # Nightly toolchain for runtime (used by the binary to fetch docs)

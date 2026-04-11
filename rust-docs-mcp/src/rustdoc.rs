@@ -4,13 +4,22 @@
 //! including toolchain validation and command execution.
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::env;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
-/// The pinned nightly toolchain version compatible with rustdoc-types 0.53.0
-pub const REQUIRED_TOOLCHAIN: &str = "nightly-2025-06-23";
+/// Preferred nightly toolchain version known to match `rustdoc-types`.
+pub const PREFERRED_TOOLCHAIN: &str = "nightly-2025-06-24";
+
+/// Fallback nightly alias to try when the preferred dated toolchain is unavailable.
+pub const FALLBACK_TOOLCHAIN: &str = "nightly";
+
+/// Environment variable allowing users to explicitly select a rustdoc toolchain.
+pub const TOOLCHAIN_ENV_VAR: &str = "RUST_DOCS_MCP_TOOLCHAIN";
 
 /// Number of lines to preview from error messages in diagnostic output
 const ERROR_MESSAGE_PREVIEW_LINES: usize = 10;
@@ -21,69 +30,207 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 4096;
 /// Timeout for individual rustdoc execution attempts (in seconds)
 const RUSTDOC_TIMEOUT_SECS: u64 = 1800;
 
-/// Check if the required nightly toolchain is available
-pub async fn validate_toolchain() -> Result<()> {
-    let output = Command::new("rustup")
-        .args(["toolchain", "list"])
-        .output()
-        .context("Failed to run rustup toolchain list")?;
+static SELECTED_TOOLCHAIN: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
-    if !output.status.success() {
-        bail!("Failed to check available toolchains");
+#[derive(Debug)]
+enum ToolchainProbe {
+    Compatible,
+    Missing,
+    Incompatible(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeFormatVersion {
+    format_version: u32,
+}
+
+/// Resolve the rustdoc toolchain to use for JSON generation.
+pub fn resolve_toolchain() -> Result<String> {
+    match SELECTED_TOOLCHAIN.get_or_init(|| select_toolchain().map_err(|err| err.to_string())) {
+        Ok(toolchain) => Ok(toolchain.clone()),
+        Err(message) => bail!("{message}"),
+    }
+}
+
+fn select_toolchain() -> Result<String> {
+    if let Some(toolchain) = env::var(TOOLCHAIN_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return match probe_toolchain(&toolchain)? {
+            ToolchainProbe::Compatible => Ok(toolchain),
+            ToolchainProbe::Missing => bail!(
+                "Configured toolchain {toolchain} from {TOOLCHAIN_ENV_VAR} is not installed. \
+Please run: rustup toolchain install {toolchain}"
+            ),
+            ToolchainProbe::Incompatible(reason) => bail!(
+                "Configured toolchain {toolchain} from {TOOLCHAIN_ENV_VAR} is not compatible \
+with rustdoc JSON format version {}: {reason}",
+                rustdoc_types::FORMAT_VERSION
+            ),
+        };
     }
 
-    let toolchains = String::from_utf8_lossy(&output.stdout);
-    if !toolchains.contains(REQUIRED_TOOLCHAIN) {
+    let preferred = probe_toolchain(PREFERRED_TOOLCHAIN)?;
+    if matches!(preferred, ToolchainProbe::Compatible) {
+        return Ok(PREFERRED_TOOLCHAIN.to_string());
+    }
+
+    let fallback = probe_toolchain(FALLBACK_TOOLCHAIN)?;
+    if matches!(fallback, ToolchainProbe::Compatible) {
+        tracing::warn!(
+            "Preferred rustdoc toolchain {} is unavailable or incompatible; falling back to {}",
+            PREFERRED_TOOLCHAIN,
+            FALLBACK_TOOLCHAIN
+        );
+        return Ok(FALLBACK_TOOLCHAIN.to_string());
+    }
+
+    let preferred_reason = match preferred {
+        ToolchainProbe::Missing => format!(
+            "{PREFERRED_TOOLCHAIN} is not installed. Install it with: rustup toolchain install \
+{PREFERRED_TOOLCHAIN}"
+        ),
+        ToolchainProbe::Incompatible(reason) => format!(
+            "{PREFERRED_TOOLCHAIN} is installed but incompatible with rustdoc JSON format \
+version {}: {reason}",
+            rustdoc_types::FORMAT_VERSION
+        ),
+        ToolchainProbe::Compatible => unreachable!(),
+    };
+
+    let fallback_reason = match fallback {
+        ToolchainProbe::Missing => {
+            format!(
+                "{FALLBACK_TOOLCHAIN} is not installed. Install it with: rustup toolchain install {FALLBACK_TOOLCHAIN}"
+            )
+        }
+        ToolchainProbe::Incompatible(reason) => format!(
+            "{FALLBACK_TOOLCHAIN} is installed but incompatible with rustdoc JSON format \
+version {}: {reason}",
+            rustdoc_types::FORMAT_VERSION
+        ),
+        ToolchainProbe::Compatible => unreachable!(),
+    };
+
+    bail!(
+        "No compatible nightly rustdoc toolchain was found.\n\
+Preferred: {preferred_reason}\n\
+Fallback: {fallback_reason}\n\
+You can also set {TOOLCHAIN_ENV_VAR} to a specific compatible nightly."
+    )
+}
+
+fn probe_toolchain(toolchain: &str) -> Result<ToolchainProbe> {
+    let version_output = Command::new("rustdoc")
+        .arg(format!("+{toolchain}"))
+        .arg("--version")
+        .output()
+        .with_context(|| format!("Failed to run rustdoc --version for toolchain {toolchain}"))?;
+
+    if !version_output.status.success() {
+        let stderr = String::from_utf8_lossy(&version_output.stderr)
+            .trim()
+            .to_string();
+        if is_missing_toolchain_error(&stderr, toolchain) {
+            return Ok(ToolchainProbe::Missing);
+        }
+
+        return Ok(ToolchainProbe::Incompatible(format!(
+            "rustdoc --version failed: {stderr}"
+        )));
+    }
+
+    match validate_rustdoc_json_format(toolchain) {
+        Ok(()) => Ok(ToolchainProbe::Compatible),
+        Err(err) => Ok(ToolchainProbe::Incompatible(err.to_string())),
+    }
+}
+
+fn is_missing_toolchain_error(stderr: &str, toolchain: &str) -> bool {
+    if !(stderr.contains("is not installed") || stderr.contains("toolchain not installed")) {
+        return false;
+    }
+
+    // Extract toolchain name from rustup's error format: 'toolchain-name'
+    // Then check it matches our query, allowing for an architecture suffix
+    // (e.g., "nightly" -> "nightly-aarch64-apple-darwin") but not a date suffix
+    // (e.g., "nightly" should NOT match "nightly-2025-06-24-aarch64-apple-darwin")
+    stderr.split('\'').nth(1).is_some_and(|name| {
+        name == toolchain
+            || name
+                .strip_prefix(toolchain)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+fn validate_rustdoc_json_format(toolchain: &str) -> Result<()> {
+    let json = generate_probe_json(toolchain)?;
+    let format: ProbeFormatVersion =
+        serde_json::from_str(&json).context("Failed to read rustdoc JSON format version")?;
+
+    if format.format_version != rustdoc_types::FORMAT_VERSION {
         bail!(
-            "Required toolchain {REQUIRED_TOOLCHAIN} is not installed. Please run: rustup toolchain install {REQUIRED_TOOLCHAIN}"
+            "expected rustdoc JSON format version {}, got {}",
+            rustdoc_types::FORMAT_VERSION,
+            format.format_version
         );
     }
 
-    tracing::debug!("Validated toolchain {} is available", REQUIRED_TOOLCHAIN);
+    let _: rustdoc_types::Crate =
+        serde_json::from_str(&json).context("Generated rustdoc JSON could not be parsed")?;
+
     Ok(())
 }
 
-/// Test rustdoc JSON functionality with a simple test file
-pub async fn test_rustdoc_json() -> Result<()> {
-    // First validate the toolchain
-    validate_toolchain().await?;
-
-    // Create a temporary directory and test file
+fn generate_probe_json(toolchain: &str) -> Result<String> {
     let temp_dir =
-        tempfile::tempdir().context("Failed to create temporary directory for testing")?;
-
+        tempfile::tempdir().context("Failed to create temporary directory for toolchain probe")?;
     let test_file = temp_dir.path().join("lib.rs");
-    std::fs::write(&test_file, "//! Test crate\npub fn test() {}")
-        .context("Failed to create test file")?;
+    let output_dir = temp_dir.path().join("out");
+    std::fs::write(&test_file, "//! Toolchain probe\npub fn probe() {}")
+        .context("Failed to create probe source file")?;
+    std::fs::create_dir(&output_dir).context("Failed to create probe output directory")?;
 
-    let test_file_str = test_file
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Test file path contains invalid UTF-8"))?;
-
-    tracing::debug!(
-        "Testing rustdoc JSON generation with {}",
-        REQUIRED_TOOLCHAIN
-    );
-
-    // Try to generate JSON documentation using the pinned toolchain
     let output = Command::new("rustdoc")
+        .arg(format!("+{toolchain}"))
         .args([
-            &format!("+{REQUIRED_TOOLCHAIN}"),
             "-Z",
             "unstable-options",
             "--output-format",
             "json",
             "--crate-name",
-            "test",
-            test_file_str,
+            "toolchain_probe",
+            "-o",
         ])
+        .arg(&output_dir)
+        .arg(&test_file)
         .output()
-        .context("Failed to run rustdoc")?;
+        .with_context(|| format!("Failed to run rustdoc probe for toolchain {toolchain}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("JSON generation failed: {stderr}");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("rustdoc JSON probe failed: {stderr}");
     }
+
+    std::fs::read_to_string(output_dir.join("toolchain_probe.json"))
+        .context("Failed to read rustdoc JSON probe output")
+}
+
+/// Check if the required nightly toolchain is available
+pub async fn validate_toolchain() -> Result<()> {
+    let toolchain = resolve_toolchain()?;
+    tracing::debug!("Validated toolchain {} is available", toolchain);
+    Ok(())
+}
+
+/// Test rustdoc JSON functionality with a simple test file
+pub async fn test_rustdoc_json() -> Result<()> {
+    let toolchain = resolve_toolchain()?;
+    tracing::debug!("Testing rustdoc JSON generation with {}", toolchain);
+    validate_rustdoc_json_format(&toolchain)?;
 
     tracing::debug!("Successfully tested rustdoc JSON generation");
     Ok(())
@@ -91,14 +238,21 @@ pub async fn test_rustdoc_json() -> Result<()> {
 
 /// Get rustdoc version information
 pub async fn get_rustdoc_version() -> Result<String> {
+    let toolchain = resolve_toolchain()?;
+    get_rustdoc_version_for_toolchain(&toolchain)
+}
+
+/// Get rustdoc version information for a specific toolchain.
+pub fn get_rustdoc_version_for_toolchain(toolchain: &str) -> Result<String> {
     let output = Command::new("rustdoc")
-        .arg(format!("+{REQUIRED_TOOLCHAIN}"))
+        .arg(format!("+{toolchain}"))
         .arg("--version")
         .output()
-        .context("Failed to run rustdoc --version")?;
+        .with_context(|| format!("Failed to run rustdoc --version for toolchain {toolchain}"))?;
 
     if !output.status.success() {
-        bail!("rustdoc command failed");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("rustdoc command failed for toolchain {toolchain}: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -230,7 +384,7 @@ pub async fn run_cargo_rustdoc_json(
     package: Option<&str>,
     target_dir: Option<&Path>,
 ) -> Result<()> {
-    validate_toolchain().await?;
+    let toolchain = resolve_toolchain()?;
 
     // Logging strategy:
     // - debug: Strategy attempts and retries
@@ -261,7 +415,7 @@ pub async fn run_cargo_rustdoc_json(
     };
     tracing::debug!("{}", log_msg);
 
-    let mut base_args = vec![format!("+{}", REQUIRED_TOOLCHAIN), "rustdoc".to_string()];
+    let mut base_args = vec![format!("+{}", toolchain), "rustdoc".to_string()];
 
     // Add package-specific arguments if provided
     if let Some(pkg) = package {
@@ -441,6 +595,13 @@ mod tests {
         // We can't guarantee the toolchain is installed in all environments
         // but we can verify it returns a valid result
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_is_missing_toolchain_error() {
+        let stderr = "error: toolchain 'nightly-2099-01-01-aarch64-apple-darwin' is not installed";
+        assert!(is_missing_toolchain_error(stderr, "nightly-2099-01-01"));
+        assert!(!is_missing_toolchain_error(stderr, "nightly"));
     }
 
     #[test]
