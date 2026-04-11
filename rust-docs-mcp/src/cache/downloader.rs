@@ -173,17 +173,33 @@ impl CrateDownloader {
             version
         );
 
-        if let Some(source_path) = self.try_copy_from_cargo_registry(name, version)? {
-            tracing::info!(
-                "Reused Cargo registry source for {}-{} at {}",
-                name,
-                version,
-                source_path.display()
-            );
-            if let Some(callback) = progress_callback {
-                callback(100);
+        // Try to reuse an already-downloaded crate from Cargo's on-disk
+        // registry cache. This is an optimization — any failure (e.g., a
+        // permission-denied $CARGO_HOME, a mid-copy I/O error) should log a
+        // warning and fall through to the regular HTTP download path rather
+        // than aborting the entire operation.
+        match self.try_copy_from_cargo_registry(name, version) {
+            Ok(Some(source_path)) => {
+                tracing::info!(
+                    "Reused Cargo registry source for {}-{} at {}",
+                    name,
+                    version,
+                    source_path.display()
+                );
+                if let Some(callback) = progress_callback {
+                    callback(100);
+                }
+                return Ok(source_path);
             }
-            return Ok(source_path);
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to reuse Cargo registry source for {}-{}: {:#}. Falling back to HTTP download.",
+                    name,
+                    version,
+                    e
+                );
+            }
         }
 
         let url = format!("https://crates.io/api/v1/crates/{name}/{version}/download");
@@ -553,21 +569,50 @@ impl CrateDownloader {
         );
 
         let source_path = self.storage.source_path(name, version)?;
-        self.storage.ensure_dir(&source_path)?;
-        copy_directory_contents(&cargo_source_path, &source_path)
-            .context("Failed to copy Cargo registry source into cache")?;
 
-        self.storage.save_metadata_with_source(
-            name,
-            version,
-            "crates.io",
-            Some(cargo_source_path.to_string_lossy().as_ref()),
-            None,
-        )?;
+        // Populate the cache from the registry source. If any step fails we
+        // roll back the partially-written source directory so the caller can
+        // safely retry via HTTP without mixing old and new files.
+        let populate = (|| -> Result<()> {
+            self.storage.ensure_dir(&source_path)?;
+            copy_directory_contents(&cargo_source_path, &source_path)
+                .context("Failed to copy Cargo registry source into cache")?;
+            self.storage.save_metadata_with_source(
+                name,
+                version,
+                "crates.io",
+                Some(cargo_source_path.to_string_lossy().as_ref()),
+                None,
+            )?;
+            Ok(())
+        })();
+
+        if let Err(e) = populate {
+            if source_path.exists()
+                && let Err(cleanup_err) = fs::remove_dir_all(&source_path)
+            {
+                tracing::warn!(
+                    "Failed to clean up partial Cargo registry copy at {}: {}",
+                    source_path.display(),
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
 
         Ok(Some(source_path))
     }
 
+    /// Look up a crate in Cargo's on-disk registry source cache.
+    ///
+    /// Cargo lays out unpacked crate sources under
+    /// `$CARGO_HOME/registry/src/<index>-<hash>/<name>-<version>/`, where
+    /// `<index>-<hash>` is derived from the registry URL (e.g.
+    /// `index.crates.io-6f17d22bba15001f`). Because users may have multiple
+    /// registries configured, we iterate every `<index>-<hash>` subdirectory
+    /// and return the first one that contains a `<name>-<version>/Cargo.toml`.
+    /// The `Cargo.toml` probe is what validates a candidate — unrelated
+    /// directories are simply skipped rather than treated as errors.
     fn find_cargo_registry_source(&self, name: &str, version: &str) -> Result<Option<PathBuf>> {
         let Some(cargo_home) = Self::cargo_home() else {
             tracing::debug!("Cargo home not found while checking local registry cache");
@@ -645,6 +690,11 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
+    /// Serializes tests that mutate the process-global `CARGO_HOME` env var.
+    /// Rust's test harness runs tests concurrently by default, so without this
+    /// lock two tests could race on `set_var`/`remove_var` and observe each
+    /// other's state — causing intermittent failures where one test sees the
+    /// other's temp directory as its `CARGO_HOME`.
     fn cargo_home_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
