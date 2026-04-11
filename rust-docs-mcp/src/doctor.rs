@@ -105,7 +105,7 @@ async fn check_rustdoc_json() -> DiagnosticResult {
                 Ok(_) => DiagnosticResult::new(
                     "Rustdoc JSON".to_string(),
                     true,
-                    format!("{} with JSON support (toolchain: {})", version, toolchain),
+                    format!("{version} with JSON support (toolchain: {toolchain})"),
                     false,
                 ),
                 Err(e) => {
