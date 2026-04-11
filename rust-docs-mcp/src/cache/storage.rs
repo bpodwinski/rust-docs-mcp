@@ -228,7 +228,23 @@ impl CacheStorage {
 
     /// Save metadata for a crate
     pub fn save_metadata(&self, name: &str, version: &str) -> Result<()> {
-        self.save_metadata_with_source(name, version, "crates.io", None, None)
+        let existing = self.load_metadata(name, version, None).ok();
+        let preserved_source = existing
+            .as_ref()
+            .map(|metadata| metadata.source.clone())
+            .unwrap_or_else(|| "crates.io".to_string());
+        let preserved_source_path = existing
+            .as_ref()
+            .and_then(|metadata| metadata.source_path.clone());
+        let preserved_member_info = existing.and_then(|metadata| metadata.member_info);
+
+        self.save_metadata_with_source(
+            name,
+            version,
+            &preserved_source,
+            preserved_source_path.as_deref(),
+            preserved_member_info,
+        )
     }
 
     /// Save metadata for a crate with source information
