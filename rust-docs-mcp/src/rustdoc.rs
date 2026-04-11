@@ -157,16 +157,13 @@ fn is_missing_toolchain_error(stderr: &str, toolchain: &str) -> bool {
     // Then check it matches our query, allowing for an architecture suffix
     // (e.g., "nightly" -> "nightly-aarch64-apple-darwin") but not a date suffix
     // (e.g., "nightly" should NOT match "nightly-2025-06-24-aarch64-apple-darwin")
-    stderr
-        .split('\'')
-        .nth(1)
-        .is_some_and(|name| {
-            name == toolchain
-                || name
-                    .strip_prefix(toolchain)
-                    .and_then(|rest| rest.strip_prefix('-'))
-                    .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
-        })
+    stderr.split('\'').nth(1).is_some_and(|name| {
+        name == toolchain
+            || name
+                .strip_prefix(toolchain)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 fn validate_rustdoc_json_format(toolchain: &str) -> Result<()> {
