@@ -29,11 +29,7 @@ pub struct CrateCache {
 
 impl std::fmt::Debug for CrateCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cache_len = self
-            .docs_cache
-            .lock()
-            .map(|c| c.len())
-            .unwrap_or(0);
+        let cache_len = self.docs_cache.lock().map(|c| c.len()).unwrap_or(0);
         f.debug_struct("CrateCache")
             .field("storage", &self.storage)
             .field("downloader", &self.downloader)
@@ -312,7 +308,9 @@ impl CrateCache {
         }
 
         // Cache miss — parse from disk.
-        tracing::debug!("LRU cache miss for {name}-{version} (member: {member_name:?}), parsing from disk");
+        tracing::debug!(
+            "LRU cache miss for {name}-{version} (member: {member_name:?}), parsing from disk"
+        );
         let crate_data = Arc::new(
             self.doc_generator
                 .load_docs(name, version, member_name)
@@ -1048,12 +1046,22 @@ mod tests {
         let version = "1.0.0";
 
         // Write v1 docs and load into the LRU.
-        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("1.0.0-v1"));
+        write_docs_fixture(
+            &cache.storage,
+            name,
+            version,
+            &minimal_docs_json("1.0.0-v1"),
+        );
         let v1 = cache.load_docs(name, version, None).await.unwrap();
         assert_eq!(v1.crate_version.as_deref(), Some("1.0.0-v1"));
 
         // Overwrite with v2 docs on disk.
-        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("1.0.0-v2"));
+        write_docs_fixture(
+            &cache.storage,
+            name,
+            version,
+            &minimal_docs_json("1.0.0-v2"),
+        );
 
         // Without eviction, load_docs returns the stale LRU entry.
         let still_v1 = cache.load_docs(name, version, None).await.unwrap();
@@ -1084,7 +1092,12 @@ mod tests {
         let version = "2.0.0";
 
         // Populate LRU.
-        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("2.0.0-old"));
+        write_docs_fixture(
+            &cache.storage,
+            name,
+            version,
+            &minimal_docs_json("2.0.0-old"),
+        );
         let _ = cache.load_docs(name, version, None).await.unwrap();
 
         // Verify entry is in the LRU.
@@ -1108,8 +1121,18 @@ mod tests {
         let cache = CrateCache::new(Some(temp_dir.path().to_path_buf())).unwrap();
 
         // Load two different crate versions into the LRU.
-        write_docs_fixture(&cache.storage, "crate-a", "1.0.0", &minimal_docs_json("a-1"));
-        write_docs_fixture(&cache.storage, "crate-b", "2.0.0", &minimal_docs_json("b-2"));
+        write_docs_fixture(
+            &cache.storage,
+            "crate-a",
+            "1.0.0",
+            &minimal_docs_json("a-1"),
+        );
+        write_docs_fixture(
+            &cache.storage,
+            "crate-b",
+            "2.0.0",
+            &minimal_docs_json("b-2"),
+        );
         let _ = cache.load_docs("crate-a", "1.0.0", None).await.unwrap();
         let _ = cache.load_docs("crate-b", "2.0.0", None).await.unwrap();
 

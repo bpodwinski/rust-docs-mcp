@@ -332,9 +332,7 @@ impl SearchIndexer {
 
             // Cheap heartbeat so long-running indexing runs aren't silent.
             if indexed.is_multiple_of(10_000) {
-                tracing::info!(
-                    "Indexed {indexed}/{upper_bound} items for {crate_name}-{version}"
-                );
+                tracing::info!("Indexed {indexed}/{upper_bound} items for {crate_name}-{version}");
             }
 
             if let Some(ref callback) = progress_callback
@@ -403,9 +401,7 @@ impl SearchIndexer {
             indexed += 1;
 
             if indexed.is_multiple_of(10_000) {
-                tracing::info!(
-                    "Indexed {indexed}/{upper_bound} items for {crate_name}-{version}"
-                );
+                tracing::info!("Indexed {indexed}/{upper_bound} items for {crate_name}-{version}");
             }
 
             if let Some(ref callback) = progress_callback

@@ -99,9 +99,7 @@ impl BenchFixture {
         let cache = CrateCache::new(Some(cache_dir.clone())).expect("cache init");
         let storage = CacheStorage::new(Some(cache_dir.clone())).expect("storage init");
 
-        let docs_path = storage
-            .docs_path(&name, &version, None)
-            .expect("docs_path");
+        let docs_path = storage.docs_path(&name, &version, None).expect("docs_path");
         if !docs_path.exists() {
             eprintln!("Fixture not found; generating (this may take several minutes)...");
             runtime.block_on(async {
@@ -191,8 +189,8 @@ fn bench_parse_only(c: &mut Criterion) {
         b.iter_batched(
             || PEAK_ALLOC.reset_peak_usage(),
             |()| {
-                let _crate_data = read_crate_from_json_pub(&fixture.docs_path)
-                    .expect("read_crate_from_json");
+                let _crate_data =
+                    read_crate_from_json_pub(&fixture.docs_path).expect("read_crate_from_json");
                 full_iter += 1;
                 let peak_mb = PEAK_ALLOC.peak_usage_as_mb();
                 eprintln!("full_parse iter {full_iter:>3}: peak heap = {peak_mb:>8.1} MB");

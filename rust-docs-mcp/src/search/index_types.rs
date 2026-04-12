@@ -127,10 +127,7 @@ where
         }
 
         // Newtype/struct variant: `{"function": { ... }}`
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<String, A::Error> {
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
             let key: String = map
                 .next_key()?
                 .ok_or_else(|| serde::de::Error::custom("empty map for ItemEnum inner"))?;
