@@ -347,11 +347,12 @@ impl CrateCache {
         self.storage.list_cached_crates()
     }
 
-    /// Remove a cached crate version
-    pub async fn remove_crate(&self, name: &str, version: &str) -> Result<()> {
-        self.storage.remove_crate(name, version)?;
-
-        // Evict all matching entries from the in-memory docs cache.
+    /// Evict all LRU cache entries matching the given crate name and version.
+    ///
+    /// Separated from [`remove_crate`](Self::remove_crate) so that code paths
+    /// that handle disk removal themselves (e.g. [`CacheTransaction::begin`])
+    /// can still invalidate the in-memory cache without double-removing from disk.
+    fn evict_docs_cache(&self, name: &str, version: &str) {
         let mut cache = self.docs_cache.lock().expect("docs_cache lock poisoned");
         let keys_to_evict: Vec<DocsCacheKey> = cache
             .iter()
@@ -361,7 +362,12 @@ impl CrateCache {
         for key in keys_to_evict {
             cache.pop(&key);
         }
+    }
 
+    /// Remove a cached crate version
+    pub async fn remove_crate(&self, name: &str, version: &str) -> Result<()> {
+        self.storage.remove_crate(name, version)?;
+        self.evict_docs_cache(name, version);
         Ok(())
     }
 
@@ -674,6 +680,9 @@ impl CrateCache {
             return CacheResponse::error(format!("Failed to start update transaction: {e}"))
                 .to_json();
         }
+
+        // Evict stale in-memory docs — transaction.begin() only removed disk files.
+        self.evict_docs_cache(crate_name, version);
 
         // Try to re-cache the crate
         let update_result = self
@@ -999,5 +1008,126 @@ impl CrateCache {
         self.doc_generator
             .create_search_index(name, version, member_name, None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a minimal valid rustdoc JSON string with a distinguishable `crate_version`.
+    fn minimal_docs_json(crate_version: &str) -> String {
+        serde_json::json!({
+            "root": 0,
+            "crate_version": crate_version,
+            "includes_private": false,
+            "index": {},
+            "paths": {},
+            "external_crates": {},
+            "target": { "triple": "x86_64-unknown-linux-gnu", "target_features": [] },
+            "format_version": 39
+        })
+        .to_string()
+    }
+
+    /// Write a docs.json fixture for a given crate into the cache storage layout.
+    fn write_docs_fixture(storage: &CacheStorage, name: &str, version: &str, json: &str) {
+        let docs_path = storage.docs_path(name, version, None).unwrap();
+        fs::create_dir_all(docs_path.parent().unwrap()).unwrap();
+        fs::write(&docs_path, json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_evict_docs_cache_clears_stale_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CrateCache::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        let name = "test-crate";
+        let version = "1.0.0";
+
+        // Write v1 docs and load into the LRU.
+        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("1.0.0-v1"));
+        let v1 = cache.load_docs(name, version, None).await.unwrap();
+        assert_eq!(v1.crate_version.as_deref(), Some("1.0.0-v1"));
+
+        // Overwrite with v2 docs on disk.
+        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("1.0.0-v2"));
+
+        // Without eviction, load_docs returns the stale LRU entry.
+        let still_v1 = cache.load_docs(name, version, None).await.unwrap();
+        assert_eq!(
+            still_v1.crate_version.as_deref(),
+            Some("1.0.0-v1"),
+            "LRU should return stale entry before eviction"
+        );
+
+        // Evict the cache — simulates what handle_crate_update now does.
+        cache.evict_docs_cache(name, version);
+
+        // Now load_docs should parse from disk and return v2.
+        let v2 = cache.load_docs(name, version, None).await.unwrap();
+        assert_eq!(
+            v2.crate_version.as_deref(),
+            Some("1.0.0-v2"),
+            "after eviction, load_docs must return fresh data from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_crate_evicts_lru() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CrateCache::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        let name = "test-crate";
+        let version = "2.0.0";
+
+        // Populate LRU.
+        write_docs_fixture(&cache.storage, name, version, &minimal_docs_json("2.0.0-old"));
+        let _ = cache.load_docs(name, version, None).await.unwrap();
+
+        // Verify entry is in the LRU.
+        {
+            let lru = cache.docs_cache.lock().unwrap();
+            assert_eq!(lru.len(), 1);
+        }
+
+        // remove_crate should evict the LRU entry (and remove disk files).
+        cache.remove_crate(name, version).await.unwrap();
+
+        {
+            let lru = cache.docs_cache.lock().unwrap();
+            assert_eq!(lru.len(), 0, "LRU must be empty after remove_crate");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evict_docs_cache_only_evicts_matching_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CrateCache::new(Some(temp_dir.path().to_path_buf())).unwrap();
+
+        // Load two different crate versions into the LRU.
+        write_docs_fixture(&cache.storage, "crate-a", "1.0.0", &minimal_docs_json("a-1"));
+        write_docs_fixture(&cache.storage, "crate-b", "2.0.0", &minimal_docs_json("b-2"));
+        let _ = cache.load_docs("crate-a", "1.0.0", None).await.unwrap();
+        let _ = cache.load_docs("crate-b", "2.0.0", None).await.unwrap();
+
+        {
+            let lru = cache.docs_cache.lock().unwrap();
+            assert_eq!(lru.len(), 2);
+        }
+
+        // Evict only crate-a.
+        cache.evict_docs_cache("crate-a", "1.0.0");
+
+        {
+            let lru = cache.docs_cache.lock().unwrap();
+            assert_eq!(lru.len(), 1, "only the evicted crate should be removed");
+        }
+
+        // crate-b should still be cached.
+        let b = cache.load_docs("crate-b", "2.0.0", None).await.unwrap();
+        assert_eq!(b.crate_version.as_deref(), Some("b-2"));
     }
 }
