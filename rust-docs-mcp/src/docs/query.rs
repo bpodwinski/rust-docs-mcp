@@ -1,8 +1,107 @@
 use anyhow::{Context, Result};
 use rmcp::schemars;
-use rustdoc_types::{Crate, Id, Item, ItemEnum};
+use rustdoc_types::{Crate, Id, Item, ItemEnum, Visibility};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+/// Return the kind of an item as a borrowed `&'static str`.
+///
+/// This is the allocation-free form used by the search indexer hot loop.
+/// [`item_kind_string`] delegates to this and adds one allocation for
+/// API backward compatibility.
+pub fn item_kind_str(inner: &ItemEnum) -> &'static str {
+    use ItemEnum::*;
+    match inner {
+        Module(_) => "module",
+        Struct(_) => "struct",
+        Enum(_) => "enum",
+        Function(_) => "function",
+        Trait(_) => "trait",
+        Impl(_) => "impl",
+        TypeAlias(_) => "type_alias",
+        Constant { .. } => "constant",
+        Static(_) => "static",
+        Macro(_) => "macro",
+        ExternCrate { .. } => "extern_crate",
+        Use(_) => "use",
+        Union(_) => "union",
+        StructField(_) => "field",
+        Variant(_) => "variant",
+        TraitAlias(_) => "trait_alias",
+        ProcMacro(_) => "proc_macro",
+        Primitive(_) => "primitive",
+        AssocConst { .. } => "assoc_const",
+        AssocType { .. } => "assoc_type",
+        ExternType => "extern_type",
+    }
+}
+
+/// Return the kind string for an item's inner enum (e.g. "struct", "function").
+///
+/// Kept as a convenience for [`DocQuery`] callers that serialize `ItemInfo`.
+/// Prefer [`item_kind_str`] in allocation-sensitive code paths.
+pub fn item_kind_string(inner: &ItemEnum) -> String {
+    item_kind_str(inner).to_string()
+}
+
+/// Return the canonical module path for an item, resolved through `crate.paths`.
+pub fn item_path(crate_data: &Crate, id: &Id) -> Vec<String> {
+    crate_data
+        .paths
+        .get(id)
+        .map(|summary| summary.path.clone())
+        .unwrap_or_default()
+}
+
+/// Format an item's visibility without allocating in the common cases.
+///
+/// `Public`, `Default`, and `Crate` return [`Cow::Borrowed`] static
+/// strings (zero allocations). Only `Restricted` allocates (one
+/// `String` via `format!`). The indexer hot loop uses this directly;
+/// [`visibility_string`] delegates to it for API compatibility.
+pub fn visibility_str_cow(vis: &Visibility) -> Cow<'static, str> {
+    use Visibility::*;
+    match vis {
+        Public => Cow::Borrowed("public"),
+        Default => Cow::Borrowed("default"),
+        Crate => Cow::Borrowed("crate"),
+        Restricted { parent, .. } => Cow::Owned(format!("restricted({})", parent.0)),
+    }
+}
+
+/// Format an item's visibility as a human-readable string.
+///
+/// Prefer [`visibility_str_cow`] in allocation-sensitive code paths.
+pub fn visibility_string(vis: &Visibility) -> String {
+    visibility_str_cow(vis).into_owned()
+}
+
+/// Build an [`ItemInfo`] for a single rustdoc item without owning the full `Crate`.
+///
+/// This is the indexing-hot-path version of [`DocQuery::item_to_info`]: it
+/// takes borrowed state so the search indexer can iterate `crate.index`
+/// without first cloning the `Crate` into a `DocQuery`.
+pub fn build_item_info(crate_data: &Crate, id: &Id, item: &Item) -> Option<ItemInfo> {
+    // Prefer the item's own name; fall back to the last path component in the
+    // crate's `paths` map for items (e.g. impl blocks) that don't store one.
+    let name = if let Some(name) = &item.name {
+        name.clone()
+    } else if let Some(path_summary) = crate_data.paths.get(id) {
+        path_summary.path.last()?.clone()
+    } else {
+        return None;
+    };
+
+    Some(ItemInfo {
+        id: id.0.to_string(),
+        name,
+        kind: item_kind_string(&item.inner),
+        path: item_path(crate_data, id),
+        docs: item.docs.clone(),
+        visibility: visibility_string(&item.visibility),
+    })
+}
 
 /// Query interface for rustdoc JSON data
 #[derive(Debug)]
@@ -175,76 +274,12 @@ impl DocQuery {
 
     /// Helper to convert an Item to ItemInfo
     fn item_to_info(&self, id: &Id, item: &Item) -> Option<ItemInfo> {
-        // Get name from item or from paths
-        let name = if let Some(name) = &item.name {
-            name.clone()
-        } else if let Some(path_summary) = self.crate_data.paths.get(id) {
-            path_summary.path.last()?.clone()
-        } else {
-            return None;
-        };
-
-        let kind = self.get_item_kind_string(&item.inner);
-        let path = self.get_item_path(id);
-        let visibility = self.get_visibility_string(&item.visibility);
-
-        Some(ItemInfo {
-            id: id.0.to_string(),
-            name,
-            kind,
-            path,
-            docs: item.docs.clone(),
-            visibility,
-        })
+        build_item_info(&self.crate_data, id, item)
     }
 
     /// Get the kind of an item as a string
     fn get_item_kind_string(&self, inner: &ItemEnum) -> String {
-        use ItemEnum::*;
-        match inner {
-            Module(_) => "module",
-            Struct(_) => "struct",
-            Enum(_) => "enum",
-            Function(_) => "function",
-            Trait(_) => "trait",
-            Impl(_) => "impl",
-            TypeAlias(_) => "type_alias",
-            Constant { .. } => "constant",
-            Static(_) => "static",
-            Macro(_) => "macro",
-            ExternCrate { .. } => "extern_crate",
-            Use(_) => "use",
-            Union(_) => "union",
-            StructField(_) => "field",
-            Variant(_) => "variant",
-            TraitAlias(_) => "trait_alias",
-            ProcMacro(_) => "proc_macro",
-            Primitive(_) => "primitive",
-            AssocConst { .. } => "assoc_const",
-            AssocType { .. } => "assoc_type",
-            ExternType => "extern_type",
-        }
-        .to_string()
-    }
-
-    /// Get the full path of an item
-    fn get_item_path(&self, id: &Id) -> Vec<String> {
-        if let Some(summary) = self.crate_data.paths.get(id) {
-            summary.path.clone()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Get visibility as a string
-    fn get_visibility_string(&self, vis: &rustdoc_types::Visibility) -> String {
-        use rustdoc_types::Visibility::*;
-        match vis {
-            Public => "public".to_string(),
-            Default => "default".to_string(),
-            Crate => "crate".to_string(),
-            Restricted { parent, .. } => format!("restricted({})", parent.0),
-        }
+        item_kind_string(inner)
     }
 
     /// Get a signature representation for an item

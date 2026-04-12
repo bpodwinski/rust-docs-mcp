@@ -256,25 +256,22 @@ impl CrateCache {
             .await
     }
 
-    /// Load documentation from cache for a crate or workspace member
+    /// Load documentation from cache for a crate or workspace member.
+    ///
+    /// `DocGenerator::load_docs` now parses directly into
+    /// [`rustdoc_types::Crate`], so this wrapper is a pass-through. It used
+    /// to go through `serde_json::Value` first, which held a second full
+    /// copy of the JSON tree in memory and was the runtime half of
+    /// issue #43.
     pub async fn load_docs(
         &self,
         name: &str,
         version: &str,
         member_name: Option<&str>,
     ) -> Result<rustdoc_types::Crate> {
-        let json_value = self
-            .doc_generator
+        self.doc_generator
             .load_docs(name, version, member_name)
-            .await?;
-        let context_msg = if member_name.is_some() {
-            "Failed to parse member documentation JSON"
-        } else {
-            "Failed to parse documentation JSON"
-        };
-        let crate_docs: rustdoc_types::Crate =
-            serde_json::from_value(json_value).context(context_msg)?;
-        Ok(crate_docs)
+            .await
     }
 
     /// Get cached versions of a crate
