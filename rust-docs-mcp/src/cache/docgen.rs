@@ -399,8 +399,8 @@ impl DocGenerator {
 
     /// Load documentation from cache for a crate or workspace member.
     ///
-    /// Parses straight into [`rustdoc_types::Crate`] via a streaming
-    /// `BufReader` + `serde_json::from_reader`, on the blocking pool. The
+    /// Parses straight into [`rustdoc_types::Crate`] via a memory-mapped
+    /// file + `serde_json::from_slice`, on the blocking pool. The
     /// previous implementation went `String → serde_json::Value →
     /// rustdoc_types::Crate`, which held multiple copies of ~1GB in memory
     /// for large crates and was the runtime-query half of issue #43.
