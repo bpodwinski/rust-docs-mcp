@@ -23,6 +23,7 @@
 use crate::cache::storage::CacheStorage;
 use crate::docs::query::{item_kind_str, visibility_str_cow};
 use crate::search::config::{DEFAULT_BUFFER_SIZE, MAX_ITEMS_PER_CRATE};
+use crate::search::index_types::{IndexCrate, IndexItem};
 use anyhow::{Context, Result};
 use rustdoc_types::{Crate, Id, Item};
 use std::path::{Path, PathBuf};
@@ -107,6 +108,67 @@ fn create_document_from_item(
 
     let docs: &str = item.docs.as_deref().unwrap_or("");
     let kind: &'static str = item_kind_str(&item.inner);
+    let visibility = visibility_str_cow(&item.visibility);
+    let item_id: u64 = id.0 as u64;
+
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.name, name);
+    doc.add_text(fields.docs, docs);
+    doc.add_text(fields.path, &path_str);
+    doc.add_text(fields.kind, kind);
+    doc.add_text(fields.crate_name, crate_name);
+    doc.add_text(fields.version, version);
+    doc.add_u64(fields.item_id, item_id);
+    doc.add_text(fields.visibility, visibility.as_ref());
+    if let Some(member_name) = member {
+        doc.add_text(fields.member, member_name);
+    }
+
+    Some(doc)
+}
+
+/// Build a [`TantivyDocument`] from an [`IndexItem`] (the trimmed
+/// indexing-only representation) without materialising the full
+/// [`rustdoc_types::Item`].
+///
+/// Mirrors [`create_document_from_item`] but reads `item.kind_tag`
+/// directly instead of calling [`item_kind_str`].
+fn create_document_from_index_item(
+    fields: &IndexFields,
+    member: Option<&str>,
+    crate_name: &str,
+    version: &str,
+    crate_data: &IndexCrate,
+    id: &Id,
+    item: &IndexItem,
+) -> Option<TantivyDocument> {
+    let name: &str = if let Some(name) = item.name.as_deref() {
+        name
+    } else {
+        crate_data
+            .paths
+            .get(id)
+            .and_then(|summary| summary.path.last())
+            .map(String::as_str)?
+    };
+
+    let path_str: String = match crate_data.paths.get(id) {
+        Some(summary) => {
+            let capacity = summary.path.iter().map(|s| s.len() + 2).sum::<usize>();
+            let mut out = String::with_capacity(capacity);
+            for (i, segment) in summary.path.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("::");
+                }
+                out.push_str(segment);
+            }
+            out
+        }
+        None => String::new(),
+    };
+
+    let docs: &str = item.docs.as_deref().unwrap_or("");
+    let kind: &str = &item.kind_tag;
     let visibility = visibility_str_cow(&item.visibility);
     let item_id: u64 = id.0 as u64;
 
@@ -279,6 +341,76 @@ impl SearchIndexer {
                 && indexed.is_multiple_of(50)
             {
                 // Reserve the final 5% for the commit step.
+                let percent = ((indexed * 95) / upper_bound.max(1)).min(95) as u8;
+                callback(percent);
+            }
+        }
+
+        writer.commit()?;
+
+        tracing::info!(
+            "Committed search index for {crate_name}-{version}: {indexed} items indexed \
+             (of {upper_bound} in crate.index)"
+        );
+
+        if let Some(callback) = progress_callback {
+            callback(100);
+        }
+
+        Ok(())
+    }
+
+    /// Add items from a trimmed [`IndexCrate`] to the search index.
+    ///
+    /// This is the optimised indexing path: [`IndexCrate`] only carries the
+    /// fields the indexer reads, so the deeply recursive `ItemEnum`
+    /// subtrees are never materialised. The iteration logic is identical
+    /// to [`add_crate_items`](Self::add_crate_items).
+    pub fn add_index_crate_items(
+        &mut self,
+        crate_name: &str,
+        version: &str,
+        crate_data: &IndexCrate,
+        progress_callback: Option<crate::cache::downloader::ProgressCallback>,
+    ) -> Result<()> {
+        let upper_bound = crate_data.index.len();
+        if upper_bound > MAX_ITEMS_PER_CRATE {
+            return Err(anyhow::anyhow!(
+                "Crate has too many items ({upper_bound}), max allowed: {MAX_ITEMS_PER_CRATE}"
+            ));
+        }
+
+        let fields = self.fields;
+        let member_name_owned = self.member.clone();
+        let member_name = member_name_owned.as_deref();
+        let writer = self.get_writer()?;
+
+        let mut indexed = 0usize;
+        for (id, item) in crate_data.index.iter() {
+            let Some(doc) = create_document_from_index_item(
+                &fields,
+                member_name,
+                crate_name,
+                version,
+                crate_data,
+                id,
+                item,
+            ) else {
+                continue;
+            };
+
+            writer.add_document(doc)?;
+            indexed += 1;
+
+            if indexed.is_multiple_of(10_000) {
+                tracing::info!(
+                    "Indexed {indexed}/{upper_bound} items for {crate_name}-{version}"
+                );
+            }
+
+            if let Some(ref callback) = progress_callback
+                && indexed.is_multiple_of(50)
+            {
                 let percent = ((indexed * 95) / upper_bound.max(1)).min(95) as u8;
                 callback(percent);
             }

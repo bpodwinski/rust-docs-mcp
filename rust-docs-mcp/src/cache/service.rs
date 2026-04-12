@@ -7,15 +7,40 @@ use crate::cache::transaction::CacheTransaction;
 use crate::cache::utils::CacheResponse;
 use crate::cache::workspace::WorkspaceHandler;
 use anyhow::{Context, Result, bail};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Cache key for the in-memory LRU of parsed `rustdoc_types::Crate` objects.
+type DocsCacheKey = (String, String, Option<String>);
+
 /// Service for managing crate caching and documentation generation
-#[derive(Debug, Clone)]
 pub struct CrateCache {
     pub(crate) storage: CacheStorage,
     downloader: CrateDownloader,
     doc_generator: DocGenerator,
+    /// LRU cache of parsed crate docs, keyed by `(name, version, member)`.
+    /// Wrapped in `std::sync::Mutex` for interior mutability so that all
+    /// methods can stay `&self` — this is required because
+    /// [`cache_workspace_members`](Self::cache_workspace_members) borrows
+    /// `&self` in multiple concurrent futures.
+    docs_cache: std::sync::Mutex<lru::LruCache<DocsCacheKey, Arc<rustdoc_types::Crate>>>,
+}
+
+impl std::fmt::Debug for CrateCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache_len = self
+            .docs_cache
+            .lock()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        f.debug_struct("CrateCache")
+            .field("storage", &self.storage)
+            .field("downloader", &self.downloader)
+            .field("doc_generator", &self.doc_generator)
+            .field("docs_cache_len", &cache_len)
+            .finish()
+    }
 }
 
 impl CrateCache {
@@ -29,6 +54,10 @@ impl CrateCache {
             storage,
             downloader,
             doc_generator,
+            docs_cache: std::sync::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(DEFAULT_DOCS_CACHE_CAPACITY)
+                    .expect("DEFAULT_DOCS_CACHE_CAPACITY must be > 0"),
+            )),
         })
     }
 
@@ -38,7 +67,7 @@ impl CrateCache {
         name: &str,
         version: &str,
         source: Option<&str>,
-    ) -> Result<rustdoc_types::Crate> {
+    ) -> Result<Arc<rustdoc_types::Crate>> {
         tracing::info!("ensure_crate_docs called for {}-{}", name, version);
 
         // Check if docs already exist
@@ -137,7 +166,7 @@ impl CrateCache {
         version: &str,
         source: Option<&str>,
         member_path: &str,
-    ) -> Result<rustdoc_types::Crate> {
+    ) -> Result<Arc<rustdoc_types::Crate>> {
         // Check if docs already exist for this member
         if self.storage.has_docs(name, version, Some(member_path)) {
             return self.load_docs(name, version, Some(member_path)).await;
@@ -187,7 +216,7 @@ impl CrateCache {
         name: &str,
         version: &str,
         member: Option<&str>,
-    ) -> Result<rustdoc_types::Crate> {
+    ) -> Result<Arc<rustdoc_types::Crate>> {
         // If member is specified, use workspace member logic
         if let Some(member_path) = member {
             return self
@@ -258,20 +287,45 @@ impl CrateCache {
 
     /// Load documentation from cache for a crate or workspace member.
     ///
-    /// `DocGenerator::load_docs` now parses directly into
-    /// [`rustdoc_types::Crate`], so this wrapper is a pass-through. It used
-    /// to go through `serde_json::Value` first, which held a second full
-    /// copy of the JSON tree in memory and was the runtime half of
-    /// issue #43.
+    /// Returns an `Arc<Crate>` backed by an in-memory LRU cache so that
+    /// repeated queries to the same crate avoid re-parsing the docs.json
+    /// from disk.
     pub async fn load_docs(
         &self,
         name: &str,
         version: &str,
         member_name: Option<&str>,
-    ) -> Result<rustdoc_types::Crate> {
-        self.doc_generator
-            .load_docs(name, version, member_name)
-            .await
+    ) -> Result<Arc<rustdoc_types::Crate>> {
+        let key: DocsCacheKey = (
+            name.to_string(),
+            version.to_string(),
+            member_name.map(|s| s.to_string()),
+        );
+
+        // Check cache — lock held only for the HashMap lookup, never across await.
+        {
+            let mut cache = self.docs_cache.lock().expect("docs_cache lock poisoned");
+            if let Some(arc) = cache.get(&key) {
+                tracing::debug!("LRU cache hit for {name}-{version} (member: {member_name:?})");
+                return Ok(Arc::clone(arc));
+            }
+        }
+
+        // Cache miss — parse from disk.
+        tracing::debug!("LRU cache miss for {name}-{version} (member: {member_name:?}), parsing from disk");
+        let crate_data = Arc::new(
+            self.doc_generator
+                .load_docs(name, version, member_name)
+                .await?,
+        );
+
+        // Insert into cache.
+        {
+            let mut cache = self.docs_cache.lock().expect("docs_cache lock poisoned");
+            cache.put(key, Arc::clone(&crate_data));
+        }
+
+        Ok(crate_data)
     }
 
     /// Get cached versions of a crate
@@ -295,7 +349,20 @@ impl CrateCache {
 
     /// Remove a cached crate version
     pub async fn remove_crate(&self, name: &str, version: &str) -> Result<()> {
-        self.storage.remove_crate(name, version)
+        self.storage.remove_crate(name, version)?;
+
+        // Evict all matching entries from the in-memory docs cache.
+        let mut cache = self.docs_cache.lock().expect("docs_cache lock poisoned");
+        let keys_to_evict: Vec<DocsCacheKey> = cache
+            .iter()
+            .filter(|((n, v, _), _)| n == name && v == version)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_evict {
+            cache.pop(&key);
+        }
+
+        Ok(())
     }
 
     /// Check if docs exist without ensuring they're generated
@@ -309,7 +376,7 @@ impl CrateCache {
         crate_name: &str,
         version: &str,
         member: Option<&str>,
-    ) -> Result<Option<rustdoc_types::Crate>> {
+    ) -> Result<Option<Arc<rustdoc_types::Crate>>> {
         if self.storage.has_docs(crate_name, version, member) {
             if let Some(member_name) = member {
                 Ok(Some(
@@ -496,6 +563,10 @@ impl CrateCache {
     ///
     /// NOTE: Each workspace member uses a unique target directory to avoid conflicts when
     /// building concurrently. See [`DocGenerator::generate_workspace_member_docs`] for details.
+    ///
+    /// Concurrency is bounded by [`DEFAULT_MAX_PARALLEL_MEMBERS`] (overridable via
+    /// `RUST_DOCS_MCP_MAX_PARALLEL_MEMBERS`) so that peak heap stays manageable
+    /// when a workspace has many members.
     async fn cache_workspace_members(
         &self,
         crate_name: &str,
@@ -506,12 +577,24 @@ impl CrateCache {
     ) -> CacheResponse {
         use futures::future::join_all;
 
-        // Create futures for all member caching operations
+        let max_parallel: usize = std::env::var("RUST_DOCS_MCP_MAX_PARALLEL_MEMBERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_PARALLEL_MEMBERS)
+            .max(1);
+
+        // Use a semaphore to bound the number of members processed concurrently.
+        // All futures are created up front (borrowing &self), but only `max_parallel`
+        // proceed past the permit acquisition at a time.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel));
+
         let member_futures: Vec<_> = members
             .iter()
             .map(|member| {
                 let member_clone = member.clone();
+                let sem = std::sync::Arc::clone(&sem);
                 async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
                     let result = self
                         .ensure_workspace_member_docs(
                             crate_name,
@@ -525,7 +608,6 @@ impl CrateCache {
             })
             .collect();
 
-        // Execute all futures concurrently (safe because each member uses a unique target directory)
         let results_with_members = join_all(member_futures).await;
 
         // Collect results and errors

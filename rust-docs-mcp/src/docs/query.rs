@@ -4,6 +4,7 @@ use rustdoc_types::{Crate, Id, Item, ItemEnum, Visibility};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Return the kind of an item as a borrowed `&'static str`.
 ///
@@ -106,7 +107,7 @@ pub fn build_item_info(crate_data: &Crate, id: &Id, item: &Item) -> Option<ItemI
 /// Query interface for rustdoc JSON data
 #[derive(Debug)]
 pub struct DocQuery {
-    crate_data: Crate,
+    crate_data: Arc<Crate>,
 }
 
 /// Simplified item information for API responses
@@ -152,7 +153,7 @@ pub struct DetailedItem {
 
 impl DocQuery {
     /// Create a new query interface for a crate's documentation
-    pub fn new(crate_data: Crate) -> Self {
+    pub fn new(crate_data: Arc<Crate>) -> Self {
         Self { crate_data }
     }
 

@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use peak_alloc::PeakAlloc;
+use rust_docs_mcp::cache::docgen::{read_crate_for_indexing, read_crate_from_json_pub};
 use rust_docs_mcp::cache::service::CrateCache;
 use rust_docs_mcp::cache::storage::CacheStorage;
 use tokio::runtime::Runtime;
@@ -75,48 +76,65 @@ fn wipe_dir_with_retry(path: &std::path::Path) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::other("wipe_dir_with_retry exhausted")))
 }
 
+/// Shared fixture setup: ensure the docs.json exists and return metadata.
+struct BenchFixture {
+    name: String,
+    version: String,
+    cache_dir: PathBuf,
+    docs_path: PathBuf,
+}
+
+impl BenchFixture {
+    fn setup() -> Self {
+        let name = std::env::var("BENCH_CRATE").unwrap_or_else(|_| "windows".to_string());
+        let version = std::env::var("BENCH_VERSION").unwrap_or_else(|_| "0.58.0".to_string());
+        let cache_dir = bench_cache_dir();
+
+        eprintln!(
+            "=== indexing bench ===\n  crate:     {name}-{version}\n  cache_dir: {}",
+            cache_dir.display()
+        );
+
+        let runtime = Runtime::new().expect("tokio runtime");
+        let cache = CrateCache::new(Some(cache_dir.clone())).expect("cache init");
+        let storage = CacheStorage::new(Some(cache_dir.clone())).expect("storage init");
+
+        let docs_path = storage
+            .docs_path(&name, &version, None)
+            .expect("docs_path");
+        if !docs_path.exists() {
+            eprintln!("Fixture not found; generating (this may take several minutes)...");
+            runtime.block_on(async {
+                cache
+                    .ensure_crate_docs(&name, &version, None)
+                    .await
+                    .expect("ensure_crate_docs");
+            });
+            eprintln!("Fixture generated at {}", docs_path.display());
+        } else {
+            eprintln!("Reusing cached fixture at {}", docs_path.display());
+        }
+
+        if let Ok(meta) = std::fs::metadata(&docs_path) {
+            let mb = (meta.len() as f64) / (1024.0 * 1024.0);
+            eprintln!("docs.json size: {mb:.1} MB");
+        }
+
+        Self {
+            name,
+            version,
+            cache_dir,
+            docs_path,
+        }
+    }
+}
+
+/// Benchmark the full indexing pipeline (parse + tantivy index).
 fn bench_indexing(c: &mut Criterion) {
-    let name = std::env::var("BENCH_CRATE").unwrap_or_else(|_| "windows".to_string());
-    let version = std::env::var("BENCH_VERSION").unwrap_or_else(|_| "0.58.0".to_string());
-    let cache_dir = bench_cache_dir();
-
-    eprintln!(
-        "=== indexing bench ===\n  crate:     {name}-{version}\n  cache_dir: {}",
-        cache_dir.display()
-    );
-
-    // Shared tokio runtime — criterion itself is sync, we just block_on inside
-    // each iteration.
+    let fixture = BenchFixture::setup();
     let runtime = Runtime::new().expect("tokio runtime");
-    let cache = CrateCache::new(Some(cache_dir.clone())).expect("cache init");
-    // Separate CacheStorage for path computation (the one inside CrateCache is
-    // crate-private). Both point at the same directory so path resolution is
-    // identical.
-    let storage = CacheStorage::new(Some(cache_dir.clone())).expect("storage init");
-
-    // One-time fixture setup: download + generate docs.json if not already cached.
-    // This is expensive (minutes) but runs once per `cargo clean`.
-    let docs_path = storage
-        .docs_path(&name, &version, None)
-        .expect("docs_path");
-    if !docs_path.exists() {
-        eprintln!("Fixture not found; generating (this may take several minutes)...");
-        runtime.block_on(async {
-            cache
-                .ensure_crate_docs(&name, &version, None)
-                .await
-                .expect("ensure_crate_docs");
-        });
-        eprintln!("Fixture generated at {}", docs_path.display());
-    } else {
-        eprintln!("Reusing cached fixture at {}", docs_path.display());
-    }
-
-    // Report fixture size for context.
-    if let Ok(meta) = std::fs::metadata(&docs_path) {
-        let mb = (meta.len() as f64) / (1024.0 * 1024.0);
-        eprintln!("docs.json size: {mb:.1} MB");
-    }
+    let cache = CrateCache::new(Some(fixture.cache_dir.clone())).expect("cache init");
+    let storage = CacheStorage::new(Some(fixture.cache_dir.clone())).expect("storage init");
 
     let mut group = c.benchmark_group("indexing");
     group.sample_size(10);
@@ -124,16 +142,13 @@ fn bench_indexing(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(5));
 
     let mut iter_counter = 0usize;
-    let bench_id = format!("{name}-{version}");
+    let bench_id = format!("{}-{}", fixture.name, fixture.version);
 
     group.bench_function(bench_id, |b| {
         b.iter_batched(
             || {
-                // Setup: wipe any existing tantivy index so every measured call
-                // builds from scratch, then reset the peak allocator counter so
-                // the reported peak only reflects the measured body.
                 let index_path = storage
-                    .search_index_path(&name, &version, None)
+                    .search_index_path(&fixture.name, &fixture.version, None)
                     .expect("search_index_path");
                 if index_path.exists() {
                     wipe_dir_with_retry(&index_path).expect("wipe old index");
@@ -143,7 +158,7 @@ fn bench_indexing(c: &mut Criterion) {
             |()| {
                 runtime.block_on(async {
                     cache
-                        .create_search_index(&name, &version, None)
+                        .create_search_index(&fixture.name, &fixture.version, None)
                         .await
                         .expect("create_search_index");
                 });
@@ -158,5 +173,50 @@ fn bench_indexing(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_indexing);
+/// Benchmark parse-only: compare full `rustdoc_types::Crate` parse vs
+/// trimmed `IndexCrate` parse. This isolates the deserialization cost
+/// and shows the memory savings from skipping `ItemEnum` subtrees.
+fn bench_parse_only(c: &mut Criterion) {
+    let fixture = BenchFixture::setup();
+
+    let mut group = c.benchmark_group("parse_only");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(120));
+    group.warm_up_time(Duration::from_secs(3));
+
+    let mut full_iter = 0usize;
+    let mut trim_iter = 0usize;
+
+    group.bench_function("full_parse", |b| {
+        b.iter_batched(
+            || PEAK_ALLOC.reset_peak_usage(),
+            |()| {
+                let _crate_data = read_crate_from_json_pub(&fixture.docs_path)
+                    .expect("read_crate_from_json");
+                full_iter += 1;
+                let peak_mb = PEAK_ALLOC.peak_usage_as_mb();
+                eprintln!("full_parse iter {full_iter:>3}: peak heap = {peak_mb:>8.1} MB");
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("trimmed_parse", |b| {
+        b.iter_batched(
+            || PEAK_ALLOC.reset_peak_usage(),
+            |()| {
+                let _crate_data =
+                    read_crate_for_indexing(&fixture.docs_path).expect("read_crate_for_indexing");
+                trim_iter += 1;
+                let peak_mb = PEAK_ALLOC.peak_usage_as_mb();
+                eprintln!("trimmed_parse iter {trim_iter:>3}: peak heap = {peak_mb:>8.1} MB");
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_indexing, bench_parse_only);
 criterion_main!(benches);

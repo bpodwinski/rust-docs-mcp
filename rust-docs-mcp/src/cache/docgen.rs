@@ -8,6 +8,7 @@ use crate::cache::downloader::ProgressCallback;
 use crate::cache::storage::CacheStorage;
 use crate::cache::workspace::WorkspaceHandler;
 use crate::rustdoc;
+use crate::search::index_types::IndexCrate;
 use crate::search::indexer::SearchIndexer;
 use anyhow::{Context, Result, bail};
 use std::fs::File;
@@ -48,6 +49,33 @@ fn read_crate_from_json(path: &Path) -> Result<rustdoc_types::Crate> {
     };
     serde_json::from_slice(&mmap)
         .with_context(|| format!("Failed to parse documentation JSON: {}", path.display()))
+}
+
+/// Parse a rustdoc JSON file into an [`IndexCrate`], which only
+/// deserialises the fields needed by the search indexer.
+///
+/// Uses the same mmap approach as [`read_crate_from_json`] but skips ~90%
+/// of per-item allocation by not materialising `ItemEnum` subtrees.
+pub fn read_crate_for_indexing(path: &Path) -> Result<IndexCrate> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open documentation file: {}", path.display()))?;
+    // SAFETY: same rationale as `read_crate_from_json` — docs.json is
+    // cache-owned and not mutated concurrently during indexing.
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .with_context(|| format!("Failed to mmap documentation file: {}", path.display()))?
+    };
+    serde_json::from_slice(&mmap).with_context(|| {
+        format!(
+            "Failed to parse documentation JSON for indexing: {}",
+            path.display()
+        )
+    })
+}
+
+/// Make `read_crate_from_json` accessible for benchmarks.
+pub fn read_crate_from_json_pub(path: &Path) -> Result<rustdoc_types::Crate> {
+    read_crate_from_json(path)
 }
 
 /// Service for generating documentation from Rust crates
@@ -463,10 +491,10 @@ impl DocGenerator {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let parse_start = std::time::Instant::now();
-            let crate_data = read_crate_from_json(&docs_path_owned)?;
+            let crate_data = read_crate_for_indexing(&docs_path_owned)?;
             let item_count = crate_data.index.len();
             tracing::info!(
-                "Parsed {label_for_task} in {:.2}s ({item_count} items)",
+                "Parsed (trimmed) {label_for_task} in {:.2}s ({item_count} items)",
                 parse_start.elapsed().as_secs_f64()
             );
 
@@ -477,7 +505,7 @@ impl DocGenerator {
                 &storage,
                 member_owned.as_deref(),
             )?;
-            indexer.add_crate_items(
+            indexer.add_index_crate_items(
                 &name_owned,
                 &version_owned,
                 &crate_data,

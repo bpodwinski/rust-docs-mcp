@@ -3289,6 +3289,7 @@ dependencies = [
  "fs4 0.13.1",
  "futures",
  "git2",
+ "lru",
  "memmap2",
  "peak_alloc",
  "ra_ap_ide",
