@@ -60,11 +60,13 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
               darwin.apple_sdk.frameworks.Security
               darwin.apple_sdk.frameworks.SystemConfiguration
-            ];
+            ]
+            ++ pkgs.lib.optional pkgs.lib.isLinux gcc.cc.lib;
 
           nativeBuildInputs = with pkgs; [
             pkg-config
-          ];
+          ]
+          ++ pkgs.lib.optional pkgs.lib.isLinux autoPatchelfHook;
         };
 
         # Build dependencies only
