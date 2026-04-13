@@ -297,9 +297,7 @@ impl SearchIndexer {
         let upper_bound = crate_data.index.len();
         if upper_bound > MAX_ITEMS_PER_CRATE {
             return Err(anyhow::anyhow!(
-                "Crate has too many items ({}), max allowed: {}",
-                upper_bound,
-                MAX_ITEMS_PER_CRATE
+                "Crate has too many items ({upper_bound}), max allowed: {MAX_ITEMS_PER_CRATE}"
             ));
         }
 
