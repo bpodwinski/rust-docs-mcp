@@ -876,4 +876,108 @@ mod tests {
             Some(cached_source.to_string_lossy().to_string())
         );
     }
+
+    #[test]
+    fn test_try_copy_from_cargo_registry_returns_none_when_crate_absent() {
+        let _guard = cargo_home_lock().lock().unwrap();
+
+        let cargo_home_dir = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+
+        // Registry index directory exists but contains no crate subdirectories.
+        fs::create_dir_all(
+            cargo_home_dir
+                .path()
+                .join("registry")
+                .join("src")
+                .join("index.crates.io-test"),
+        )
+        .unwrap();
+
+        set_cargo_home(cargo_home_dir.path());
+
+        let storage = CacheStorage::new(Some(storage_dir.path().to_path_buf())).unwrap();
+        let downloader = CrateDownloader::new(storage.clone());
+
+        let result = downloader
+            .try_copy_from_cargo_registry("cached-crate", "9.9.9")
+            .unwrap();
+
+        remove_cargo_home();
+
+        assert_eq!(result, None);
+        assert!(
+            !storage
+                .source_path("cached-crate", "9.9.9")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !storage
+                .metadata_path("cached-crate", "9.9.9", None)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn test_try_copy_from_cargo_registry_rolls_back_partial_copy() {
+        let _guard = cargo_home_lock().lock().unwrap();
+
+        let cargo_home_dir = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+
+        // Pre-populate a valid cargo registry source.
+        let cached_source = cargo_home_dir
+            .path()
+            .join("registry")
+            .join("src")
+            .join("index.crates.io-test")
+            .join("cached-crate-9.9.9");
+        fs::create_dir_all(cached_source.join("src")).unwrap();
+        fs::write(
+            cached_source.join(CARGO_TOML),
+            "[package]\nname = \"cached-crate\"\nversion = \"9.9.9\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            cached_source.join("src").join("lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        set_cargo_home(cargo_home_dir.path());
+
+        let storage = CacheStorage::new(Some(storage_dir.path().to_path_buf())).unwrap();
+
+        // Force `copy_directory_contents` to fail mid-walk by planting an empty
+        // directory at the destination path where `src/lib.rs` would be copied.
+        // `fs::copy` opens the destination via `File::create`, which errors out
+        // on a directory (EISDIR on Unix; access-denied on Windows). This
+        // happens after `ensure_dir(&source_path)` succeeds and potentially
+        // after `Cargo.toml` is already copied — so the rollback branch must
+        // clean up genuinely partial state.
+        let source_path = storage.source_path("cached-crate", "9.9.9").unwrap();
+        let planted_lib_rs = source_path.join("src").join("lib.rs");
+        fs::create_dir_all(&planted_lib_rs).unwrap();
+
+        let downloader = CrateDownloader::new(storage.clone());
+
+        let result = downloader.try_copy_from_cargo_registry("cached-crate", "9.9.9");
+
+        remove_cargo_home();
+
+        // We only assert the error shape, never the error text — the underlying
+        // OS error code differs across platforms.
+        assert!(result.is_err(), "expected Err from try_copy, got Ok");
+        assert!(
+            !source_path.exists(),
+            "rollback should have removed the partially-copied source directory"
+        );
+        // Sanity check: the cargo registry source was not touched by the rollback.
+        assert!(
+            cached_source.join("src").join("lib.rs").is_file(),
+            "rollback must not reach outside storage's source_path"
+        );
+    }
 }
