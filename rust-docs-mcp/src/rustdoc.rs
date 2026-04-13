@@ -268,7 +268,7 @@ pub fn get_rustdoc_version_for_toolchain(toolchain: &str) -> Result<String> {
 ///
 /// The recommended order is: [`AllFeatures`](Self::AllFeatures) →
 /// [`DefaultFeatures`](Self::DefaultFeatures) → [`NoDefaultFeatures`](Self::NoDefaultFeatures)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(clippy::enum_variant_names)]
 enum FeatureStrategy {
     /// Use --all-features (enables all feature flags)
@@ -277,6 +277,8 @@ enum FeatureStrategy {
     DefaultFeatures,
     /// Use --no-default-features (minimal)
     NoDefaultFeatures,
+    /// Use --no-default-features --features=a,b,c (specific features only)
+    Specific(Vec<String>),
 }
 
 impl FeatureStrategy {
@@ -286,15 +288,30 @@ impl FeatureStrategy {
             Self::AllFeatures => vec!["--all-features".to_string()],
             Self::DefaultFeatures => vec![],
             Self::NoDefaultFeatures => vec!["--no-default-features".to_string()],
+            Self::Specific(features) => {
+                let mut args = vec!["--no-default-features".to_string()];
+                if !features.is_empty() {
+                    args.push("--features".to_string());
+                    args.push(features.join(","));
+                }
+                args
+            }
         }
     }
 
     /// Get a description of this strategy for logging
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         match self {
-            Self::AllFeatures => "all features enabled",
-            Self::DefaultFeatures => "default features only",
-            Self::NoDefaultFeatures => "no default features",
+            Self::AllFeatures => "all features enabled".to_string(),
+            Self::DefaultFeatures => "default features only".to_string(),
+            Self::NoDefaultFeatures => "no default features".to_string(),
+            Self::Specific(features) => {
+                if features.is_empty() {
+                    "specific features (none)".to_string()
+                } else {
+                    format!("specific features: {}", features.join(", "))
+                }
+            }
         }
     }
 }
@@ -383,6 +400,7 @@ pub async fn run_cargo_rustdoc_json(
     source_path: &Path,
     package: Option<&str>,
     target_dir: Option<&Path>,
+    features: Option<Vec<String>>,
 ) -> Result<()> {
     let toolchain = resolve_toolchain()?;
 
@@ -423,12 +441,22 @@ pub async fn run_cargo_rustdoc_json(
         base_args.push(pkg.to_string());
     }
 
-    // Try different feature strategies in order
-    let strategies = [
-        FeatureStrategy::AllFeatures,
-        FeatureStrategy::DefaultFeatures,
-        FeatureStrategy::NoDefaultFeatures,
-    ];
+    // Try different feature strategies in order.
+    // When specific features are requested, use them first instead of --all-features.
+    // This allows crates with mutually exclusive features to be cached successfully.
+    let strategies: Vec<FeatureStrategy> = if let Some(feats) = features {
+        vec![
+            FeatureStrategy::Specific(feats),
+            FeatureStrategy::DefaultFeatures,
+            FeatureStrategy::NoDefaultFeatures,
+        ]
+    } else {
+        vec![
+            FeatureStrategy::AllFeatures,
+            FeatureStrategy::DefaultFeatures,
+            FeatureStrategy::NoDefaultFeatures,
+        ]
+    };
 
     let mut failed_attempts = Vec::new();
 
@@ -618,6 +646,18 @@ mod tests {
             FeatureStrategy::NoDefaultFeatures.args(),
             vec!["--no-default-features".to_string()]
         );
+        assert_eq!(
+            FeatureStrategy::Specific(vec!["axum".to_string()]).args(),
+            vec![
+                "--no-default-features".to_string(),
+                "--features".to_string(),
+                "axum".to_string(),
+            ]
+        );
+        assert_eq!(
+            FeatureStrategy::Specific(vec![]).args(),
+            vec!["--no-default-features".to_string()]
+        );
     }
 
     #[test]
@@ -633,6 +673,10 @@ mod tests {
         assert_eq!(
             FeatureStrategy::NoDefaultFeatures.description(),
             "no default features"
+        );
+        assert_eq!(
+            FeatureStrategy::Specific(vec!["axum".to_string(), "ssr".to_string()]).description(),
+            "specific features: axum, ssr"
         );
     }
 

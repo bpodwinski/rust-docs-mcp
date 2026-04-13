@@ -138,7 +138,7 @@ impl CrateCache {
         // Note: progress_callback is None here because this method is called from
         // various places. The progress-aware path goes through cache_crate_with_source
         // which passes progress callbacks directly to generate_docs.
-        match self.generate_docs(name, version, None).await {
+        match self.generate_docs(name, version, None, None).await {
             Ok(_) => {
                 // Load and return the generated docs
                 self.load_docs(name, version, None).await
@@ -175,7 +175,7 @@ impl CrateCache {
         }
 
         // Generate documentation for the specific workspace member
-        self.generate_workspace_member_docs(name, version, member_path, None)
+        self.generate_workspace_member_docs(name, version, member_path, None, None)
             .await?;
 
         // Get package name for the member
@@ -262,9 +262,10 @@ impl CrateCache {
         name: &str,
         version: &str,
         progress_callback: Option<crate::cache::downloader::ProgressCallback>,
+        features: Option<Vec<String>>,
     ) -> Result<PathBuf> {
         self.doc_generator
-            .generate_docs(name, version, progress_callback)
+            .generate_docs(name, version, progress_callback, features)
             .await
     }
 
@@ -275,9 +276,10 @@ impl CrateCache {
         version: &str,
         member_path: &str,
         progress_callback: Option<crate::cache::downloader::ProgressCallback>,
+        features: Option<Vec<String>>,
     ) -> Result<PathBuf> {
         self.doc_generator
-            .generate_workspace_member_docs(name, version, member_path, progress_callback)
+            .generate_workspace_member_docs(name, version, member_path, progress_callback, features)
             .await
     }
 
@@ -515,7 +517,14 @@ impl CrateCache {
     fn extract_source_params(
         &self,
         source: &CrateSource,
-    ) -> (String, String, Option<Vec<String>>, Option<String>, bool) {
+    ) -> (
+        String,
+        String,
+        Option<Vec<String>>,
+        Option<String>,
+        bool,
+        Option<Vec<String>>,
+    ) {
         match source {
             CrateSource::CratesIO(params) => (
                 params.crate_name.clone(),
@@ -523,6 +532,7 @@ impl CrateCache {
                 params.members.clone(),
                 None,
                 params.update.unwrap_or(false),
+                params.features.clone(),
             ),
             CrateSource::GitHub(params) => {
                 let version = if let Some(branch) = &params.branch {
@@ -548,6 +558,7 @@ impl CrateCache {
                     params.members.clone(),
                     source_str,
                     params.update.unwrap_or(false),
+                    params.features.clone(),
                 )
             }
             CrateSource::LocalPath(params) => (
@@ -559,6 +570,7 @@ impl CrateCache {
                 params.members.clone(),
                 Some(params.path.clone()),
                 params.update.unwrap_or(false),
+                params.features.clone(),
             ),
         }
     }
@@ -807,7 +819,7 @@ impl CrateCache {
         };
 
         // Extract parameters from source
-        let (crate_name, version, members, source_str, update) =
+        let (crate_name, version, members, source_str, update, features) =
             self.extract_source_params(&source);
 
         tracing::info!(
@@ -942,7 +954,7 @@ impl CrateCache {
             tm.update_step(tid, 1, "Running cargo rustdoc").await;
         }
 
-        match self.generate_docs(&crate_name, &version, None).await {
+        match self.generate_docs(&crate_name, &version, None, features).await {
             Ok(_) => {
                 // Update to indexing stage
                 if let (Some(tm), Some(tid)) = (&task_manager, &task_id) {
