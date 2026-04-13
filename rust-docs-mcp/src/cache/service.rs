@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 /// Cache key for the in-memory LRU of parsed `rustdoc_types::Crate` objects.
 type DocsCacheKey = (String, String, Option<String>);
+type SourceParams = (String, String, Option<Vec<String>>, Option<String>, bool, Option<Vec<String>>);
 
 /// Service for managing crate caching and documentation generation
 pub struct CrateCache {
@@ -514,17 +515,7 @@ impl CrateCache {
     }
 
     /// Extract source parameters from CrateSource enum
-    fn extract_source_params(
-        &self,
-        source: &CrateSource,
-    ) -> (
-        String,
-        String,
-        Option<Vec<String>>,
-        Option<String>,
-        bool,
-        Option<Vec<String>>,
-    ) {
+    fn extract_source_params(&self, source: &CrateSource) -> SourceParams {
         match source {
             CrateSource::CratesIO(params) => (
                 params.crate_name.clone(),
@@ -954,7 +945,10 @@ impl CrateCache {
             tm.update_step(tid, 1, "Running cargo rustdoc").await;
         }
 
-        match self.generate_docs(&crate_name, &version, None, features).await {
+        match self
+            .generate_docs(&crate_name, &version, None, features)
+            .await
+        {
             Ok(_) => {
                 // Update to indexing stage
                 if let (Some(tm), Some(tid)) = (&task_manager, &task_id) {

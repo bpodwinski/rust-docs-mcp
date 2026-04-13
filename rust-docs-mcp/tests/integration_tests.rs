@@ -162,6 +162,7 @@ async fn setup_test_crate(service: &RustDocsService) -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     // Start the async caching operation
@@ -217,6 +218,7 @@ async fn test_cache_from_crates_io() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     // Start async caching operation
@@ -267,6 +269,7 @@ async fn test_cache_from_github() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -319,6 +322,7 @@ async fn test_cache_from_github_branch() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -380,6 +384,7 @@ edition = "2021"
         path: Some(test_crate_dir.path().to_str().unwrap().to_string()),
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -460,6 +465,7 @@ serde = {{ workspace = true }}
         path: Some(workspace_dir.path().to_str().unwrap().to_string()),
         members: None, // Should detect workspace and return member list
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -502,6 +508,7 @@ async fn test_cache_update() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response1 = service.cache_crate(Parameters(params1)).await;
@@ -523,6 +530,7 @@ async fn test_cache_update() -> Result<()> {
         path: None,
         members: None,
         update: Some(true),
+        features: None,
     };
 
     let response2 = service.cache_crate(Parameters(params2)).await;
@@ -551,6 +559,7 @@ async fn test_invalid_inputs() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -574,6 +583,7 @@ async fn test_invalid_inputs() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -605,6 +615,7 @@ async fn test_invalid_inputs() -> Result<()> {
         path: Some("/this/path/does/not/exist".to_string()),
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
@@ -643,6 +654,7 @@ async fn test_concurrent_caching() -> Result<()> {
             path: None,
             members: None,
             update: None,
+        features: None,
         };
         let start = std::time::Instant::now();
         let response = service.cache_crate(Parameters(params)).await;
@@ -705,6 +717,7 @@ async fn test_concurrent_caching() -> Result<()> {
             path: None,
             members: None,
             update: Some(false), // Should not re-download if already cached
+            features: None,
         };
         let response = service.cache_crate(Parameters(params)).await;
         let task = parse_cache_task_started(&response)?;
@@ -768,6 +781,7 @@ edition = "2021"
         path: Some(workspace_dir.path().to_str().unwrap().to_string()),
         members: None,
         update: None,
+        features: None,
     };
 
     let response1 = service.cache_crate(Parameters(params1)).await;
@@ -798,6 +812,7 @@ edition = "2021"
         path: Some(workspace_dir.path().to_str().unwrap().to_string()),
         members: Some(vec!["lib-a".to_string(), "lib-b".to_string()]),
         update: None,
+        features: None,
     };
 
     let response2 = service.cache_crate(Parameters(params2)).await;
@@ -1415,6 +1430,7 @@ async fn test_cache_bevy_with_feature_fallback() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     // Use a longer timeout for bevy as it's a large crate
@@ -1467,6 +1483,7 @@ async fn test_step_tracking() -> Result<()> {
         path: None,
         members: None,
         update: None,
+        features: None,
     };
 
     let response = service.cache_crate(Parameters(params)).await;
