@@ -8,10 +8,75 @@ use crate::cache::downloader::ProgressCallback;
 use crate::cache::storage::CacheStorage;
 use crate::cache::workspace::WorkspaceHandler;
 use crate::rustdoc;
+use crate::search::index_types::IndexCrate;
 use crate::search::indexer::SearchIndexer;
 use anyhow::{Context, Result, bail};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Read and parse a rustdoc JSON file into a [`rustdoc_types::Crate`].
+///
+/// Uses [`memmap2::Mmap`] + [`serde_json::from_slice`] so that:
+/// - the raw JSON bytes live in the page cache, NOT the Rust heap — so
+///   `peak_alloc`-style heap trackers don't count them against us, and
+///   the process doesn't hold a second copy of a multi-GB file just
+///   to feed the parser;
+/// - the parser uses the slice-based code path, which is ~1.5-2x faster
+///   than `from_reader` because it can backtrack in place instead of
+///   pulling one byte at a time through `io::Bytes`.
+///
+/// Synchronous — wrap in [`tokio::task::spawn_blocking`] when calling
+/// from async code, since serde_json's parser is sync and can block for
+/// seconds to minutes on large inputs.
+///
+/// # Safety
+///
+/// [`memmap2::Mmap::map`] is `unsafe` because the kernel mapping is
+/// undefined behaviour if the file is mutated or truncated by another
+/// process while the mapping is live. This is sound here because the
+/// rust-docs-mcp cache owns the docs.json file for the lifetime of
+/// indexing: it's written once by `cargo rustdoc` under the cache lock
+/// and nothing else touches it until the index build completes.
+fn read_crate_from_json(path: &Path) -> Result<rustdoc_types::Crate> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open documentation file: {}", path.display()))?;
+    // SAFETY: see the function-level `# Safety` note — docs.json is
+    // cache-owned and not mutated concurrently during indexing.
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .with_context(|| format!("Failed to mmap documentation file: {}", path.display()))?
+    };
+    serde_json::from_slice(&mmap)
+        .with_context(|| format!("Failed to parse documentation JSON: {}", path.display()))
+}
+
+/// Parse a rustdoc JSON file into an [`IndexCrate`], which only
+/// deserialises the fields needed by the search indexer.
+///
+/// Uses the same mmap approach as [`read_crate_from_json`] but skips ~90%
+/// of per-item allocation by not materialising `ItemEnum` subtrees.
+pub fn read_crate_for_indexing(path: &Path) -> Result<IndexCrate> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open documentation file: {}", path.display()))?;
+    // SAFETY: same rationale as `read_crate_from_json` — docs.json is
+    // cache-owned and not mutated concurrently during indexing.
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .with_context(|| format!("Failed to mmap documentation file: {}", path.display()))?
+    };
+    serde_json::from_slice(&mmap).with_context(|| {
+        format!(
+            "Failed to parse documentation JSON for indexing: {}",
+            path.display()
+        )
+    })
+}
+
+/// Make `read_crate_from_json` accessible for benchmarks.
+pub fn read_crate_from_json_pub(path: &Path) -> Result<rustdoc_types::Crate> {
+    read_crate_from_json(path)
+}
 
 /// Service for generating documentation from Rust crates
 #[derive(Debug, Clone)]
@@ -360,13 +425,19 @@ impl DocGenerator {
         Ok(deps)
     }
 
-    /// Load documentation from cache for a crate or workspace member
+    /// Load documentation from cache for a crate or workspace member.
+    ///
+    /// Parses straight into [`rustdoc_types::Crate`] via a memory-mapped
+    /// file + `serde_json::from_slice`, on the blocking pool. The
+    /// previous implementation went `String → serde_json::Value →
+    /// rustdoc_types::Crate`, which held multiple copies of ~1GB in memory
+    /// for large crates and was the runtime-query half of issue #43.
     pub async fn load_docs(
         &self,
         name: &str,
         version: &str,
         member_name: Option<&str>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<rustdoc_types::Crate> {
         let docs_path = self.storage.docs_path(name, version, member_name)?;
 
         if !docs_path.exists() {
@@ -377,14 +448,9 @@ impl DocGenerator {
             }
         }
 
-        let json_string = tokio::fs::read_to_string(&docs_path)
+        tokio::task::spawn_blocking(move || read_crate_from_json(&docs_path))
             .await
-            .context("Failed to read documentation file")?;
-
-        let docs: serde_json::Value =
-            serde_json::from_str(&json_string).context("Failed to parse documentation JSON")?;
-
-        Ok(docs)
+            .context("documentation loading task panicked")?
     }
 
     /// Create search index for a crate or workspace member
@@ -395,41 +461,66 @@ impl DocGenerator {
         member_name: Option<&str>,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<()> {
-        let log_prefix = if let Some(member) = member_name {
-            format!("workspace member {member} in")
-        } else {
-            String::new()
+        let target_label = match member_name {
+            Some(member) => format!("workspace member {member} in {name}-{version}"),
+            None => format!("{name}-{version}"),
         };
 
-        tracing::info!(
-            "Creating search index for {}{}-{}",
-            log_prefix,
-            name,
-            version
-        );
+        tracing::info!("Creating search index for {target_label}");
 
-        // Load the generated documentation
         let docs_path = self.storage.docs_path(name, version, member_name)?;
 
-        let docs_json = tokio::fs::read_to_string(&docs_path)
-            .await
-            .context("Failed to read documentation for indexing")?;
+        // Report file size up front so slow indexing runs can be correlated
+        // with input size in the logs.
+        if let Ok(meta) = std::fs::metadata(&docs_path) {
+            let mb = (meta.len() as f64) / (1024.0 * 1024.0);
+            tracing::info!("Indexing {target_label}: docs.json size = {mb:.1} MB");
+        }
 
-        let crate_data: rustdoc_types::Crate = serde_json::from_str(&docs_json)
-            .context("Failed to parse documentation JSON for indexing")?;
+        // Both the JSON parse and the tantivy indexing are fully synchronous
+        // and can block for minutes on large crates. Run the entire pipeline
+        // inside a single `spawn_blocking` so the async runtime stays free
+        // (and so we never hop runtimes mid-operation, which would require
+        // extra synchronization across the parsed `Crate` struct).
+        let storage = self.storage.clone();
+        let name_owned = name.to_string();
+        let version_owned = version.to_string();
+        let member_owned = member_name.map(|m| m.to_string());
+        let docs_path_owned = docs_path.clone();
+        let label_for_task = target_label.clone();
 
-        // Create the search indexer for this crate or workspace member
-        let mut indexer = SearchIndexer::new_for_crate(name, version, &self.storage, member_name)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let parse_start = std::time::Instant::now();
+            let crate_data = read_crate_for_indexing(&docs_path_owned)?;
+            let item_count = crate_data.index.len();
+            tracing::info!(
+                "Parsed (trimmed) {label_for_task} in {:.2}s ({item_count} items)",
+                parse_start.elapsed().as_secs_f64()
+            );
 
-        // Add all crate items to the index with progress tracking
-        indexer.add_crate_items(name, version, &crate_data, progress_callback)?;
+            let index_start = std::time::Instant::now();
+            let mut indexer = SearchIndexer::new_for_crate(
+                &name_owned,
+                &version_owned,
+                &storage,
+                member_owned.as_deref(),
+            )?;
+            indexer.add_index_crate_items(
+                &name_owned,
+                &version_owned,
+                &crate_data,
+                progress_callback,
+            )?;
+            tracing::info!(
+                "Indexed {label_for_task} in {:.2}s ({item_count} items)",
+                index_start.elapsed().as_secs_f64()
+            );
+            Ok(())
+        })
+        .await
+        .context("search indexing task panicked")??;
 
-        tracing::info!(
-            "Successfully created search index for {}{}-{}",
-            log_prefix,
-            name,
-            version
-        );
+        tracing::info!("Successfully created search index for {target_label}");
         Ok(())
     }
 }

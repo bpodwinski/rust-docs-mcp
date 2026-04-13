@@ -19,6 +19,7 @@
 
 pub mod config;
 pub mod fuzzy;
+pub mod index_types;
 pub mod indexer;
 pub mod outputs;
 pub mod tools;

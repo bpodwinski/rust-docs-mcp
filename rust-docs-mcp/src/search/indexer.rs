@@ -21,13 +21,14 @@
 //! ```
 
 use crate::cache::storage::CacheStorage;
-use crate::docs::query::{DocQuery, ItemInfo};
-use crate::search::config::{DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MAX_ITEMS_PER_CRATE};
+use crate::docs::query::{item_kind_str, visibility_str_cow};
+use crate::search::config::{DEFAULT_BUFFER_SIZE, MAX_ITEMS_PER_CRATE};
+use crate::search::index_types::{IndexCrate, IndexItem};
 use anyhow::{Context, Result};
-use rustdoc_types::Crate;
+use rustdoc_types::{Crate, Id, Item};
 use std::path::{Path, PathBuf};
 use tantivy::{
-    Index, IndexWriter, TantivyDocument, doc,
+    Index, IndexWriter, TantivyDocument,
     schema::{FAST, Field, STORED, STRING, Schema, TEXT},
 };
 
@@ -40,7 +41,7 @@ pub struct SearchIndexer {
     member: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct IndexFields {
     name: Field,
     docs: Field,
@@ -51,6 +52,140 @@ pub struct IndexFields {
     item_id: Field,
     visibility: Field,
     member: Field,
+}
+
+/// Build a single [`TantivyDocument`] directly from a rustdoc `Item` without
+/// materializing an intermediate [`crate::docs::query::ItemInfo`].
+///
+/// All text fields are passed as `&str` borrows into tantivy — which is
+/// optimal because tantivy's `add_text` writes bytes straight into its
+/// internal `node_data: Vec<u8>` regardless of ownership, so there's no
+/// benefit to handing it an owned `String`. Passing `String` would just
+/// add an allocation that gets dropped immediately after tantivy copies
+/// the bytes out.
+///
+/// Returns `None` for items that don't produce an indexable document —
+/// typically anonymous items (impl blocks, etc.) that have neither a
+/// direct name nor a path entry in `crate.paths`.
+fn create_document_from_item(
+    fields: &IndexFields,
+    member: Option<&str>,
+    crate_name: &str,
+    version: &str,
+    crate_data: &Crate,
+    id: &Id,
+    item: &Item,
+) -> Option<TantivyDocument> {
+    // Prefer the item's own name; fall back to the last path component
+    // from `crate.paths`. Both are borrowed — no allocation.
+    let name: &str = if let Some(name) = item.name.as_deref() {
+        name
+    } else {
+        crate_data
+            .paths
+            .get(id)
+            .and_then(|summary| summary.path.last())
+            .map(String::as_str)?
+    };
+
+    // Build `path_str` with pre-sized capacity so `join`-ing the path
+    // segments doesn't reallocate. Two bytes per segment account for the
+    // `::` separators.
+    let path_str: String = match crate_data.paths.get(id) {
+        Some(summary) => {
+            let capacity = summary.path.iter().map(|s| s.len() + 2).sum::<usize>();
+            let mut out = String::with_capacity(capacity);
+            for (i, segment) in summary.path.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("::");
+                }
+                out.push_str(segment);
+            }
+            out
+        }
+        None => String::new(),
+    };
+
+    let docs: &str = item.docs.as_deref().unwrap_or("");
+    let kind: &'static str = item_kind_str(&item.inner);
+    let visibility = visibility_str_cow(&item.visibility);
+    let item_id: u64 = id.0 as u64;
+
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.name, name);
+    doc.add_text(fields.docs, docs);
+    doc.add_text(fields.path, &path_str);
+    doc.add_text(fields.kind, kind);
+    doc.add_text(fields.crate_name, crate_name);
+    doc.add_text(fields.version, version);
+    doc.add_u64(fields.item_id, item_id);
+    doc.add_text(fields.visibility, visibility.as_ref());
+    if let Some(member_name) = member {
+        doc.add_text(fields.member, member_name);
+    }
+
+    Some(doc)
+}
+
+/// Build a [`TantivyDocument`] from an [`IndexItem`] (the trimmed
+/// indexing-only representation) without materialising the full
+/// [`rustdoc_types::Item`].
+///
+/// Mirrors [`create_document_from_item`] but reads `item.kind_tag`
+/// directly instead of calling [`item_kind_str`].
+fn create_document_from_index_item(
+    fields: &IndexFields,
+    member: Option<&str>,
+    crate_name: &str,
+    version: &str,
+    crate_data: &IndexCrate,
+    id: &Id,
+    item: &IndexItem,
+) -> Option<TantivyDocument> {
+    let name: &str = if let Some(name) = item.name.as_deref() {
+        name
+    } else {
+        crate_data
+            .paths
+            .get(id)
+            .and_then(|summary| summary.path.last())
+            .map(String::as_str)?
+    };
+
+    let path_str: String = match crate_data.paths.get(id) {
+        Some(summary) => {
+            let capacity = summary.path.iter().map(|s| s.len() + 2).sum::<usize>();
+            let mut out = String::with_capacity(capacity);
+            for (i, segment) in summary.path.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("::");
+                }
+                out.push_str(segment);
+            }
+            out
+        }
+        None => String::new(),
+    };
+
+    let docs: &str = item.docs.as_deref().unwrap_or("");
+    let kind: &str = &item.kind_tag;
+    let visibility = visibility_str_cow(&item.visibility);
+    let item_id: u64 = id.0 as u64;
+
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.name, name);
+    doc.add_text(fields.docs, docs);
+    doc.add_text(fields.path, &path_str);
+    doc.add_text(fields.kind, kind);
+    doc.add_text(fields.crate_name, crate_name);
+    doc.add_text(fields.version, version);
+    doc.add_u64(fields.item_id, item_id);
+    doc.add_text(fields.visibility, visibility.as_ref());
+    if let Some(member_name) = member {
+        doc.add_text(fields.member, member_name);
+    }
+
+    Some(doc)
 }
 
 impl SearchIndexer {
@@ -123,11 +258,14 @@ impl SearchIndexer {
         })
     }
 
-    /// Get or create an IndexWriter with proper buffer size
+    /// Get or create an IndexWriter with the configured buffer size.
+    ///
+    /// The buffer is split across up to 8 tantivy indexing threads, with a
+    /// per-thread floor of ~15MB — so [`DEFAULT_BUFFER_SIZE`] needs to be
+    /// large enough to feed all cores or we silently lose parallelism.
     fn get_writer(&mut self) -> Result<&mut IndexWriter> {
         if self.writer.is_none() {
-            let buffer_size = std::cmp::min(DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE);
-            let writer = self.index.writer(buffer_size)?;
+            let writer = self.index.writer(DEFAULT_BUFFER_SIZE)?;
             self.writer = Some(writer);
         }
         self.writer
@@ -135,7 +273,16 @@ impl SearchIndexer {
             .ok_or_else(|| anyhow::anyhow!("IndexWriter not initialized"))
     }
 
-    /// Add crate items to the search index
+    /// Add crate items to the search index by streaming them from
+    /// `crate.index` directly into the tantivy writer.
+    ///
+    /// Each item is indexed in place: borrow from `&Item` → build a
+    /// [`TantivyDocument`] with all text fields passed as `&str` → hand
+    /// it off to the writer → drop. No intermediate `ItemInfo`,
+    /// `Vec<ItemInfo>`, or `Vec<TantivyDocument>` is materialized, and
+    /// every field is sourced by reference from the parsed [`Crate`].
+    /// This is what lets us index crates with hundreds of thousands of
+    /// items without peak memory ballooning or per-item allocator churn.
     pub fn add_crate_items(
         &mut self,
         crate_name: &str,
@@ -143,64 +290,65 @@ impl SearchIndexer {
         crate_data: &Crate,
         progress_callback: Option<crate::cache::downloader::ProgressCallback>,
     ) -> Result<()> {
-        let query = DocQuery::new(crate_data.clone());
-        let items = query.list_items(None); // Get all items without filtering
-
-        // Limit number of items to prevent resource exhaustion
-        if items.len() > MAX_ITEMS_PER_CRATE {
+        // Upper-bound check against the raw index size. The real indexed
+        // count will typically be slightly lower (some items, e.g.
+        // anonymous impl blocks, don't produce a document), but if even
+        // the upper bound exceeds the cap we bail without doing any work.
+        let upper_bound = crate_data.index.len();
+        if upper_bound > MAX_ITEMS_PER_CRATE {
             return Err(anyhow::anyhow!(
-                "Crate has too many items ({}), max allowed: {}",
-                items.len(),
-                MAX_ITEMS_PER_CRATE
+                "Crate has too many items ({upper_bound}), max allowed: {MAX_ITEMS_PER_CRATE}"
             ));
         }
 
-        self.add_items_to_index(crate_name, version, &items, progress_callback)?;
-        Ok(())
-    }
-
-    /// Add items to the search index
-    fn add_items_to_index(
-        &mut self,
-        crate_name: &str,
-        version: &str,
-        items: &[ItemInfo],
-        progress_callback: Option<crate::cache::downloader::ProgressCallback>,
-    ) -> Result<()> {
-        let total_items = items.len();
-
-        // Create all documents first
-        let mut documents = Vec::new();
-        for (i, item) in items.iter().enumerate() {
-            let doc = self.create_document_from_item(crate_name, version, item)?;
-            documents.push(doc);
-
-            // Report progress every 50 items during document creation (0-70%)
-            if let Some(ref callback) = progress_callback
-                && (i % 50 == 0 || i == total_items - 1)
-            {
-                let percent = ((i * 70) / total_items.max(1)).min(70) as u8;
-                callback(percent);
-            }
-        }
-
-        // Then add all documents to the writer
+        // Capture `self` state before taking the `&mut` borrow for the
+        // writer. `IndexFields` is `Copy`, so this is free. `member` is
+        // borrowed by its `as_deref`ed lifetime; we need the owned
+        // clone so the reference lives across the writer borrow.
+        let fields = self.fields;
+        let member_name_owned = self.member.clone();
+        let member_name = member_name_owned.as_deref();
         let writer = self.get_writer()?;
-        for (i, doc) in documents.iter().enumerate() {
-            writer.add_document(doc.clone())?;
 
-            // Report progress during writing (70-95%)
+        let mut indexed = 0usize;
+        for (id, item) in crate_data.index.iter() {
+            let Some(doc) = create_document_from_item(
+                &fields,
+                member_name,
+                crate_name,
+                version,
+                crate_data,
+                id,
+                item,
+            ) else {
+                continue;
+            };
+
+            writer.add_document(doc)?;
+
+            indexed += 1;
+
+            // Cheap heartbeat so long-running indexing runs aren't silent.
+            if indexed.is_multiple_of(10_000) {
+                tracing::info!("Indexed {indexed}/{upper_bound} items for {crate_name}-{version}");
+            }
+
             if let Some(ref callback) = progress_callback
-                && (i % 50 == 0 || i == documents.len() - 1)
+                && indexed.is_multiple_of(50)
             {
-                let percent = (70 + ((i * 25) / documents.len().max(1))).min(95) as u8;
+                // Reserve the final 5% for the commit step.
+                let percent = ((indexed * 95) / upper_bound.max(1)).min(95) as u8;
                 callback(percent);
             }
         }
 
         writer.commit()?;
 
-        // Report 100% complete
+        tracing::info!(
+            "Committed search index for {crate_name}-{version}: {indexed} items indexed \
+             (of {upper_bound} in crate.index)"
+        );
+
         if let Some(callback) = progress_callback {
             callback(100);
         }
@@ -208,38 +356,72 @@ impl SearchIndexer {
         Ok(())
     }
 
-    /// Create a Tantivy document from an ItemInfo
-    fn create_document_from_item(
-        &self,
+    /// Add items from a trimmed [`IndexCrate`] to the search index.
+    ///
+    /// This is the optimised indexing path: [`IndexCrate`] only carries the
+    /// fields the indexer reads, so the deeply recursive `ItemEnum`
+    /// subtrees are never materialised. The iteration logic is identical
+    /// to [`add_crate_items`](Self::add_crate_items).
+    pub fn add_index_crate_items(
+        &mut self,
         crate_name: &str,
         version: &str,
-        item: &ItemInfo,
-    ) -> Result<TantivyDocument> {
-        let item_id: u64 = item
-            .id
-            .parse()
-            .with_context(|| format!("Failed to parse item ID: {}", item.id))?;
-
-        let path_str = item.path.join("::");
-        let docs_str = item.docs.clone().unwrap_or_default();
-
-        let mut doc = doc!(
-            self.fields.name => item.name.clone(),
-            self.fields.docs => docs_str,
-            self.fields.path => path_str,
-            self.fields.kind => item.kind.clone(),
-            self.fields.crate_name => crate_name.to_string(),
-            self.fields.version => version.to_string(),
-            self.fields.item_id => item_id,
-            self.fields.visibility => item.visibility.clone(),
-        );
-
-        // Add member field if present
-        if let Some(member_name) = &self.member {
-            doc.add_text(self.fields.member, member_name.clone());
+        crate_data: &IndexCrate,
+        progress_callback: Option<crate::cache::downloader::ProgressCallback>,
+    ) -> Result<()> {
+        let upper_bound = crate_data.index.len();
+        if upper_bound > MAX_ITEMS_PER_CRATE {
+            return Err(anyhow::anyhow!(
+                "Crate has too many items ({upper_bound}), max allowed: {MAX_ITEMS_PER_CRATE}"
+            ));
         }
 
-        Ok(doc)
+        let fields = self.fields;
+        let member_name_owned = self.member.clone();
+        let member_name = member_name_owned.as_deref();
+        let writer = self.get_writer()?;
+
+        let mut indexed = 0usize;
+        for (id, item) in crate_data.index.iter() {
+            let Some(doc) = create_document_from_index_item(
+                &fields,
+                member_name,
+                crate_name,
+                version,
+                crate_data,
+                id,
+                item,
+            ) else {
+                continue;
+            };
+
+            writer.add_document(doc)?;
+            indexed += 1;
+
+            if indexed.is_multiple_of(10_000) {
+                tracing::info!("Indexed {indexed}/{upper_bound} items for {crate_name}-{version}");
+            }
+
+            if let Some(ref callback) = progress_callback
+                && indexed.is_multiple_of(50)
+            {
+                let percent = ((indexed * 95) / upper_bound.max(1)).min(95) as u8;
+                callback(percent);
+            }
+        }
+
+        writer.commit()?;
+
+        tracing::info!(
+            "Committed search index for {crate_name}-{version}: {indexed} items indexed \
+             (of {upper_bound} in crate.index)"
+        );
+
+        if let Some(callback) = progress_callback {
+            callback(100);
+        }
+
+        Ok(())
     }
 
     /// Check if the index has any documents
