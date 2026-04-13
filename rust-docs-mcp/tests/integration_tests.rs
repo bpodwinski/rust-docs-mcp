@@ -654,7 +654,7 @@ async fn test_concurrent_caching() -> Result<()> {
             path: None,
             members: None,
             update: None,
-        features: None,
+            features: None,
         };
         let start = std::time::Instant::now();
         let response = service.cache_crate(Parameters(params)).await;

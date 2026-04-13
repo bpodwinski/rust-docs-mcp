@@ -13,7 +13,14 @@ use std::sync::Arc;
 
 /// Cache key for the in-memory LRU of parsed `rustdoc_types::Crate` objects.
 type DocsCacheKey = (String, String, Option<String>);
-type SourceParams = (String, String, Option<Vec<String>>, Option<String>, bool, Option<Vec<String>>);
+type SourceParams = (
+    String,
+    String,
+    Option<Vec<String>>,
+    Option<String>,
+    bool,
+    Option<Vec<String>>,
+);
 
 /// Service for managing crate caching and documentation generation
 pub struct CrateCache {
